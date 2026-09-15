@@ -85,7 +85,11 @@
             ｜计划 {{ pickup(c.id)!.scheduledTime || '—' }}
             ｜{{ pickup(c.id)!.status === 'picked' ? `实际 ${pickup(c.id)!.actualTime}` : '未离园' }}
             ｜授权码{{ pickup(c.id)!.pinVerified ? '已核验' : '未核验(离线)' }}
+            <span v-if="pickup(c.id)!.confirmedBy">｜门卫确认：{{ pickup(c.id)!.confirmedBy }}</span>
             <span v-if="pickup(c.id)!.createdVia === 'offline'">｜门卫离线记录已补传</span>
+          </span>
+          <span v-if="pickupSource(pickup(c.id)!)" class="small" style="color:var(--purple)">
+            📎 授权来源：{{ pickupSource(pickup(c.id)!) }}
           </span>
           <img v-if="pickup(c.id)!.photoUrl" :src="pickup(c.id)!.photoUrl ?? ''" class="pick-thumb" />
         </div>
@@ -100,6 +104,30 @@
           <span class="small">{{ m.fromName }}：{{ m.content }}（{{ timeShort(m.createdAt) }}）</span>
         </div>
       </div>
+    </div>
+
+    <!-- 当天临时授权档案 -->
+    <div class="card">
+      <h3>📎 当天临时授权接送档案（后续询问备查）</h3>
+      <div v-if="tempAuthorizations.length" class="temp-grid">
+        <div v-for="pc in tempAuthorizations" :key="pc.id" class="temp-card">
+          <img v-if="pc.idPhotoUrl" :src="pc.idPhotoUrl" class="id-img" />
+          <div class="small">
+            <b style="font-size:14px">{{ childName(pc.childId) }}</b> → <b>{{ pc.newPersonName }}</b>
+            <span class="badge" :class="pc.status==='approved'?'badge-purple':pc.status==='rejected'?'badge-red':'badge-amber'">
+              {{ pc.status === 'approved' ? '已批准' : pc.status === 'rejected' ? '已驳回' : '待核身' }}
+            </span>
+            <div class="muted" style="line-height:1.7;margin-top:4px">
+              关系：{{ relationLabel[pc.newRelation || 'temporary'] }} ｜手机：{{ pc.newPhone || '—' }}<br />
+              有效期：{{ pc.validFrom?.slice(11) }} – {{ pc.validUntil?.slice(11) }}<br />
+              原因：{{ pc.reason }}<br />
+              申请人：{{ pc.requestedBy }} ｜核身：{{ pc.approvedBy || '—' }}
+              <template v-if="pc.status === 'approved'">｜授权码 <b>{{ pc.newPin }}</b></template>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p v-else class="muted small">今日无临时授权记录</p>
     </div>
 
     <!-- 班级安全复盘 -->
@@ -160,6 +188,10 @@ const className = (id: string) => data.className(id)
 const shortClass = (id?: string | null) => data.className(id).split(' · ')[0]
 const childName = (id: string) => data.childById(id)?.name || '—'
 const pickup = (id: string) => data.effectivePickupByChild[id]
+const personById = (pid?: string | null) => data.state.authorizedPersons.find(p => p.id === pid)
+const pickupSource = (p: any) => personById(p?.personId)?.source || ''
+const tempAuthorizations = computed(() =>
+  [...data.state.pickupChanges].filter(pc => pc.changeType === 'person').reverse())
 const meds = (id: string) => data.state.medPlans.filter(m => m.childId === id)
 const medReg = (id: string) => data.parseMedicine(hc.value[id]?.medicine)
 const obs = (id: string) => data.state.observations.filter(o => o.childId === id)
@@ -187,6 +219,9 @@ function print() { window.print() }
 .t-item { display: flex; flex-direction: column; gap: 1px; }
 .t-item b { font-size: 13px; }
 .pick-thumb { width: 64px; height: 64px; border-radius: 8px; object-fit: cover; margin-top: 4px; }
+.temp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+.temp-card { display: flex; gap: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: #fafbfe; }
+.id-img { width: 110px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); flex-shrink: 0; }
 .review-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .review-line { padding: 4px 0; border-bottom: 1px dashed #f0f2f8; line-height: 1.6; }
 .review-line.red { color: var(--red); }

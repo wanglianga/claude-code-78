@@ -40,8 +40,14 @@
                   <span class="badge" :class="relClass(pickup.relation)" style="margin-left:8px">
                     {{ relationLabel[pickup.relation || ''] || '临时授权人' }}
                   </span>
+                  <span v-if="personSource(pickup)" class="badge badge-purple source-badge" :title="personSource(pickup)">
+                    📎 {{ sourceShort(personSource(pickup)) }}
+                  </span>
                 </div>
                 <div v-if="pickup.status === 'picked'" class="badge badge-gray">已于 {{ pickup.actualTime }} 接走</div>
+              </div>
+              <div v-if="personValidUntil(pickup)" class="valid-line">
+                ⏱ 临时授权有效期至 <b>{{ personValidUntil(pickup)?.slice(11) }}</b>，到期自动恢复原名单
               </div>
 
               <!-- 在线核验授权码 -->
@@ -67,7 +73,7 @@
                     <select v-model="off.personId">
                       <option value="" disabled>请选择</option>
                       <option v-for="p in offlinePersons" :key="p.id" :value="p.id">
-                        {{ p.name }}（{{ relationLabel[p.relation] }} · 证件尾号 {{ p.idLast4 || '—' }}）
+                        {{ p.name }}（{{ relationLabel[p.relation] }} · 证件尾号 {{ p.idLast4 || '—' }}）{{ p.validUntil ? ` ·临时至${p.validUntil.slice(11)}` : '' }}
                       </option>
                     </select>
                   </label>
@@ -90,7 +96,10 @@
             <div class="pass-title">✅ 身份核验通过</div>
             <dl class="kv">
               <dt>幼儿</dt><dd><b>{{ child?.name }}</b>（{{ shortClass(child?.classId) }}）</dd>
-              <dt>接送人</dt><dd>{{ verified.person.name }} · {{ relationLabel[verified.person.relation] }} · {{ verified.person.phone }}</dd>
+              <dt>接送人</dt><dd>{{ verified.person.name }} · {{ relationLabel[verified.person.relation] }} · {{ verified.person.phone || '—' }}</dd>
+              <dt>授权来源</dt><dd><b class="source-text">{{ verified.person.source || '常驻授权' }}</b></dd>
+              <dt v-if="verified.person.validUntil">有效期</dt>
+              <dd v-if="verified.person.validUntil">至 {{ String(verified.person.validUntil).slice(11) }}（到期不可再刷）</dd>
               <dt>授权码</dt><dd class="green">✔ 核验正确</dd>
             </dl>
             <div style="margin:10px 0"><PhotoCapture v-model="photoUrl" /></div>
@@ -144,6 +153,7 @@
                 <td>{{ shortClass(childById(p.childId)?.classId) }}</td>
                 <td>{{ p.personName }}
                   <span class="badge" :class="relClass(p.relation)" style="margin-left:4px">{{ relationLabel[p.relation || ''] || '临时' }}</span>
+                  <span v-if="personSource(p)" :title="personSource(p)" class="source-dot">📎</span>
                 </td>
                 <td>{{ p.scheduledTime || '—' }}</td>
                 <td>
@@ -234,7 +244,7 @@ const child = ref<Child | null>(null)
 const pin = ref('')
 const verifyErr = ref('')
 // 服务端签发的一次性放行结果（令牌 + 服务端返回的接送人信息）
-const verified = ref<{ token: string; person: { id: string; name: string; relation: string; phone?: string } } | null>(null)
+const verified = ref<{ token: string; person: { id: string; name: string; relation: string; phone?: string; source?: string; validUntil?: string | null } } | null>(null)
 const photoUrl = ref('')
 const denyOpen = ref(false)
 const off = ref({ personId: '', photoUrl: '' })
@@ -253,6 +263,20 @@ function relClass(r?: string) {
 }
 const pickup = computed<Pickup | undefined>(() =>
   child.value ? data.effectivePickupByChild[child.value.id] : undefined)
+// 授权人档案（含来源与有效期）
+function personOf(personId?: string | null) {
+  return data.state.authorizedPersons.find(p => p.id === personId)
+}
+function personSource(p: Pickup | undefined) {
+  return personOf(p?.personId)?.source || ''
+}
+function personValidUntil(p: Pickup | undefined) {
+  return personOf(p?.personId)?.validUntil || null
+}
+function sourceShort(s: string) {
+  // "临时授权·亲友·李妈妈（家长）申请·王老师核身" → "临时授权·亲友"
+  return s.split('·').slice(0, 2).join('·')
+}
 // 本机最后一次同步到的当日授权名单（离线可选范围）
 const offlinePersons = computed(() =>
   child.value ? data.state.authorizedPersons.filter(p => p.childId === child.value!.id) : [])
@@ -366,6 +390,10 @@ function labelOf(e: any) {
 .child-pick-btn.sel { border-color: var(--brand); background: #fff7ef; }
 .person-panel { border-top: 1px dashed var(--line); padding-top: 12px; }
 .person-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.source-badge { font-weight: 500; }
+.source-dot { cursor: help; }
+.valid-line { font-size: 12px; color: var(--purple); background: var(--purple-bg); border-radius: 8px; padding: 5px 9px; margin-bottom: 10px; }
+.source-text { color: var(--purple); }
 .pin-input { width: 180px; font-size: 26px; letter-spacing: 10px; text-align: center; padding: 8px; }
 .big-btn { padding: 11px 18px; font-size: 15px; }
 .verify-err { color: var(--red); background: var(--red-bg); padding: 8px 12px; border-radius: 8px; font-weight: 700; }

@@ -15,6 +15,7 @@
               <div class="small muted">
                 {{ c.busRoute ? '🚌 ' + c.busRoute + ' · ' : '' }}
                 当前接送：{{ pickupName(c.id) }}
+                <span v-if="tempSource(c.id)" class="badge badge-purple" style="margin-left:6px" :title="tempSource(c.id)">📎 临时授权</span>
                 <span v-if="transferMap[c.id]" class="badge badge-purple" style="margin-left:6px">
                   托管至 {{ shortClass(transferMap[c.id].toClassId) }}
                 </span>
@@ -150,28 +151,46 @@
     <!-- 改接审批 + 家长沟通 -->
     <div v-if="tab === 'approvals'" class="col">
       <div class="card">
-        <h3>🔁 接送变更审批（批准后门卫/家长端立即切换授权）</h3>
+        <h3>🔁 临时授权接送核身（批准后门卫/家长端立即切换，到期自动恢复原名单）</h3>
         <div v-for="pc in pendingChanges" :key="pc.id" class="change-item">
-          <div>
-            <b>{{ childName(pc.childId) }}</b>
+          <div class="change-main">
+            <b style="font-size:15px">{{ childName(pc.childId) }}</b>
             <span v-if="pc.changeType === 'person'">
               改由 <b class="new-person">{{ pc.newPersonName }}</b>
-              （{{ relationLabel[pc.newRelation || 'temporary'] }}，手机 {{ pc.newPhone || '—' }}，证件后四位 {{ pc.newIdLast4 || '—' }}）
+              <span class="badge" :class="relClass(pc.newRelation)">{{ relationLabel[pc.newRelation || 'temporary'] }}</span>
             </span>
             <span v-else>改时间为 <b>{{ pc.newTime }}</b></span>
-            <div class="small muted">事由：{{ pc.reason }} ｜申请人：{{ pc.requestedBy }} ｜{{ timeShort(pc.createdAt) }}</div>
+
+            <div v-if="pc.changeType === 'person'" class="idcard-row">
+              <img v-if="pc.idPhotoUrl" :src="pc.idPhotoUrl" class="id-thumb" title="点击查看证件照" @click="idPreview = pc.idPhotoUrl" />
+              <dl class="kv">
+                <dt>手机</dt><dd>{{ pc.newPhone || '—' }}</dd>
+                <dt>证件尾号</dt><dd>{{ pc.newIdLast4 || '—' }}</dd>
+                <dt>有效期</dt><dd>
+                  <b :class="isExpired(pc) ? 'red' : ''">
+                    {{ pc.validFrom?.slice(11) }} – {{ pc.validUntil?.slice(11) }}
+                    <span v-if="isExpired(pc)" class="badge badge-red" style="margin-left:4px">已过期</span>
+                  </b>
+                </dd>
+                <dt>事由</dt><dd>{{ pc.reason }}</dd>
+                <dt>申请人</dt><dd>{{ pc.requestedBy }} ｜ {{ timeShort(pc.createdAt) }}</dd>
+              </dl>
+            </div>
+            <div v-else class="small muted">事由：{{ pc.reason }} ｜{{ pc.requestedBy }} ｜{{ timeShort(pc.createdAt) }}</div>
+
             <div v-if="pc.status !== 'pending'" class="small">
               状态：<span :class="pc.status === 'approved' ? 'green' : 'red'">
-                {{ pc.status === 'approved' ? '已批准 · 各端已同步' : '已驳回 · 维持原授权' }}
+                {{ pc.status === 'approved' ? `已核身批准 · ${pc.approvedBy} · 各端已同步` : '已驳回 · 维持原授权' }}
               </span>
             </div>
           </div>
-          <div v-if="pc.status === 'pending'" class="row" style="gap:6px">
-            <button class="btn btn-green btn-sm" @click="approve(pc)">核身批准</button>
+          <div v-if="pc.status === 'pending'" class="col" style="gap:6px; align-items:flex-end">
+            <button class="btn btn-green btn-sm" @click="openIdCheck(pc)">核身批准</button>
             <button class="btn btn-red btn-sm" @click="reject(pc)">驳回</button>
           </div>
-          <div v-else-if="pc.changeType === 'person' && pc.status === 'approved'" class="small" style="color:var(--purple)">
-            临时授权码：<b>{{ pc.newPin }}</b>（当日有效，已下发家长端与门卫端）
+          <div v-else-if="pc.changeType === 'person' && pc.status === 'approved'" class="approved-box small">
+            <div>临时授权码：<b style="font-size:15px">{{ pc.newPin }}</b></div>
+            <div class="muted">有效期 {{ pc.validFrom?.slice(11) }}–{{ pc.validUntil?.slice(11) }}，已下发家长与门卫端</div>
           </div>
         </div>
         <p v-if="!myChanges.length" class="muted small">暂无接送变更申请</p>
@@ -191,6 +210,38 @@
           </select>
           <input v-model="msg.content" class="grow" placeholder="给家长留言，将实时推送到家长端" @keyup.enter="sendMsg" />
           <button class="btn btn-primary" @click="sendMsg">发送</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 证件照放大预览 -->
+    <div v-if="idPreview" class="modal-mask" @click.self="idPreview = ''">
+      <div class="modal" style="max-width:420px">
+        <h3>临时接送人证件照</h3>
+        <img :src="idPreview" class="id-full" />
+        <div style="text-align:right;margin-top:10px"><button class="btn" @click="idPreview = ''">关闭</button></div>
+      </div>
+    </div>
+
+    <!-- 证件核身弹窗 -->
+    <div v-if="idCheck" class="modal-mask" @click.self="idCheck = null">
+      <div class="modal">
+        <h3>核身批准 · {{ childName(idCheck.childId) }}</h3>
+        <div class="idcheck-body">
+          <img :src="idCheck.idPhotoUrl!" class="id-full" />
+          <dl class="kv">
+            <dt>接送人</dt><dd><b>{{ idCheck.newPersonName }}</b>（{{ relationLabel[idCheck.newRelation || 'temporary'] }}）</dd>
+            <dt>手机</dt><dd>{{ idCheck.newPhone || '—' }}</dd>
+            <dt>证件尾号</dt><dd>{{ idCheck.newIdLast4 || '—' }}</dd>
+            <dt>有效期</dt><dd>{{ idCheck.validFrom?.slice(11) }} – {{ idCheck.validUntil?.slice(11) }}</dd>
+            <dt>事由</dt><dd>{{ idCheck.reason }}</dd>
+            <dt>申请人</dt><dd>{{ idCheck.requestedBy }}</dd>
+          </dl>
+        </div>
+        <label class="check-line"><input type="checkbox" v-model="idConfirmed" style="width:auto" /> 已电话向家长复核，并确认来人证件与照片一致</label>
+        <div class="spread" style="margin-top:10px">
+          <button class="btn" @click="idCheck = null">取消</button>
+          <button class="btn btn-green" :disabled="!idConfirmed" @click="doApprove">确认核身并批准（生成临时授权码）</button>
         </div>
       </div>
     </div>
@@ -293,6 +344,11 @@ function pickupName(childId: string) {
   if (!p) return '待安排'
   return `${p.personName || '—'}（${relationLabel[p.relation || ''] || '临时'} ${p.scheduledTime ? p.scheduledTime : ''}）${p.status === 'picked' ? '·已接走' : ''}`
 }
+function tempSource(childId: string) {
+  const p = data.effectivePickupByChild[childId]
+  const a = data.state.authorizedPersons.find(x => x.id === p?.personId)
+  return a?.source?.startsWith('临时授权') ? (a.source || '') : ''
+}
 
 async function decide(c: Child, action: string) {
   try {
@@ -365,10 +421,32 @@ async function changeMedTime(m: MedPlan) {
 }
 
 // 改接审批
-async function approve(pc: PickupChange) {
-  await api.approveChange(pc.id, auth.user?.name || '班主任')
-  ui.show('已批准，门卫/家长端授权已切换')
+const idCheck = ref<PickupChange | null>(null)
+const idConfirmed = ref(false)
+const idPreview = ref('')
+function nowLocalStamp() {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
+function isExpired(pc: PickupChange) {
+  return !!pc.validUntil && pc.validUntil <= nowLocalStamp()
+}
+function relClass(r?: string | null) {
+  return ({ parent: 'badge-blue', grandparent: 'badge-green', nanny: 'badge-amber', temporary: 'badge-purple' } as Record<string, string>)[r || ''] || 'badge-gray'
+}
+function openIdCheck(pc: PickupChange) {
+  if (isExpired(pc)) { ui.show('该授权已过有效期，请让家长重新申请', 'err'); return }
+  idCheck.value = pc
+  idConfirmed.value = false
+}
+async function doApprove() {
+  if (!idCheck.value || !idConfirmed.value) return
+  await api.approveChange(idCheck.value.id, auth.user?.name || '班主任')
+  ui.show('已核身批准，门卫/家长端授权已切换')
+  idCheck.value = null
+}
+async function approve(pc: PickupChange) { openIdCheck(pc) }
 async function reject(pc: PickupChange) {
   await api.rejectChange(pc.id, auth.user?.name || '班主任')
   ui.show('已驳回，维持原授权')
@@ -415,6 +493,17 @@ async function sendMsg() {
 }
 .obs-item:last-child, .transfer-item:last-child, .change-item:last-child { border-bottom: none; }
 .change-item { justify-content: space-between; align-items: flex-start; }
+.change-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+.idcard-row { display: flex; gap: 14px; align-items: flex-start; }
+.id-thumb {
+  width: 88px; height: 58px; object-fit: cover; border-radius: 8px;
+  border: 1px solid var(--line); cursor: zoom-in; background: #f4f6fb;
+}
+.id-full { width: 100%; max-height: 260px; object-fit: contain; border-radius: 10px; border: 1px solid var(--line); background: #f4f6fb; }
+.idcheck-body { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 12px; }
+.idcheck-body .id-full { width: 180px; flex-shrink: 0; }
+.approved-box { background: var(--purple-bg); border-radius: 10px; padding: 8px 10px; color: var(--purple); }
+.check-line { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-top: 8px; }
 .new-person { color: var(--brand-2); }
 .green { color: var(--green); font-weight: 700; }
 .red { color: var(--red); font-weight: 700; }

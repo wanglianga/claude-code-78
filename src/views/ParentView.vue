@@ -96,6 +96,7 @@
           <template v-if="pc.changeType === 'person'">
             改接「{{ pc.newPersonName }}」：
             <span :class="statusColor(pc.status)">{{ statusText(pc.status) }}</span>
+            <span v-if="pc.validFrom" class="muted"> 有效期 {{ pc.validFrom.slice(11) }}–{{ pc.validUntil?.slice(11) }}</span>
             <span v-if="pc.status === 'approved'" class="pin-box">临时授权码 <b>{{ pc.newPin }}</b>（请当面告知接送人，门卫核验）</span>
           </template>
           <template v-else>
@@ -104,8 +105,8 @@
         </div>
 
         <details class="auth-list">
-          <summary class="small muted">常驻授权接送人（{{ persons(c.id).length }} 人）</summary>
-          <div v-for="p in persons(c.id)" :key="p.id" class="person-line small">
+          <summary class="small muted">常驻授权接送人（{{ regularPersons(c.id).length }} 人）</summary>
+          <div v-for="p in regularPersons(c.id)" :key="p.id" class="person-line small">
             <b>{{ p.name }}</b>（{{ relationLabel[p.relation] }}）{{ p.phone }} · 授权码 {{ p.pin }}
           </div>
         </details>
@@ -136,14 +137,14 @@
       <div class="modal">
         <h3>{{ changeForm.changeType === 'person' ? '临时改接申请' : '接送时间变更' }} · {{ changeForm.childName }}</h3>
         <template v-if="changeForm.changeType === 'person'">
-          <p class="small muted">提交后由班主任核身批准，批准前门卫端不放行；批准后自动生成当日临时授权码。</p>
+          <p class="small muted">提交后由班主任核身批准，批准前门卫端不放行；批准后自动生成当日一次性接送授权码，授权到期自动恢复原接送名单。</p>
           <div class="row">
             <label class="field grow"><span>接送人姓名</span><input v-model="changeForm.newPersonName" placeholder="如 李奶奶" /></label>
-            <label class="field grow"><span>关系</span>
+            <label class="field grow"><span>授权关系</span>
               <select v-model="changeForm.newRelation">
                 <option value="grandparent">祖辈</option>
                 <option value="nanny">保姆</option>
-                <option value="temporary">临时授权人（朋友/同事）</option>
+                <option value="temporary">临时授权人（亲友/同事）</option>
               </select>
             </label>
           </div>
@@ -151,7 +152,17 @@
             <label class="field grow"><span>手机号</span><input v-model="changeForm.newPhone" /></label>
             <label class="field grow"><span>身份证后四位</span><input v-model="changeForm.newIdLast4" maxlength="4" /></label>
           </div>
-          <label class="field"><span>预计到达时间</span><input v-model="changeForm.newTime" type="time" /></label>
+          <label class="field">
+            <span>身份证照片（核身与当天档案留存，必填）</span>
+            <PhotoCapture v-model="changeForm.idPhotoUrl" />
+          </label>
+          <div class="row">
+            <label class="field grow"><span>授权生效时间</span><input v-model="changeForm.validFrom" type="datetime-local" /></label>
+            <label class="field grow"><span>授权失效时间</span>
+              <input v-model="changeForm.validUntil" type="datetime-local" />
+            </label>
+          </div>
+          <p class="small muted">临时授权仅限当日，失效后门卫端自动恢复原接送名单，临时接送人无法再次刷入。</p>
         </template>
         <template v-else>
           <label class="field"><span>新的接离时间</span><input v-model="changeForm.newTime" type="time" /></label>
@@ -173,6 +184,7 @@ import { useAuthStore } from '../store/auth'
 import { useUiStore } from '../store/ui'
 import { api } from '../api'
 import { conclusionLabel, actionLabel, relationLabel, timeShort } from '../helpers'
+import PhotoCapture from '../components/PhotoCapture.vue'
 import type { Child } from '../types'
 
 const data = useDataStore()
@@ -192,6 +204,7 @@ const obs = (id: string) => data.state.observations.filter(o => o.childId === id
 const transfer = (id: string) => data.activeTransferByChild[id]
 const pickup = (id: string) => data.effectivePickupByChild[id]
 const persons = (id: string) => data.state.authorizedPersons.filter(p => p.childId === id)
+const regularPersons = (id: string) => persons(id).filter(p => !p.validUntil)
 const changes = (id: string) => data.state.pickupChanges.filter(pc => pc.childId === id)
 const msgs = (id: string) => data.state.communications.filter(m => m.childId === id)
 const confirmed = (id: string) => data.state.confirmations.find(c => c.childId === id)
@@ -209,20 +222,54 @@ function relClass(r?: string) {
 function statusText(s: string) { return s === 'pending' ? '⏳ 待班主任审批（门卫暂不放行）' : s === 'approved' ? '✅ 已批准，各端已同步' : '❌ 未通过，维持原授权' }
 function statusColor(s: string) { return s === 'approved' ? 'green' : s === 'rejected' ? 'red' : 'muted' }
 
+function pad(n: number) { return String(n).padStart(2, '0') }
+function todayStamps(addMin = 120) {
+  const d = new Date()
+  const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  const to = new Date(d.getTime() + addMin * 60_000)
+  return {
+    date,
+    from: `${date}T${pad(d.getHours())}:${pad(d.getMinutes())}`,
+    until: `${date}T${pad(to.getHours())}:${pad(to.getMinutes())}`
+  }
+}
+
 const changeForm = reactive({
   open: false, childId: '', childName: '', changeType: 'person' as 'person' | 'time',
-  newPersonName: '', newRelation: 'grandparent', newPhone: '', newIdLast4: '', newTime: '17:00', reason: ''
+  newPersonName: '', newRelation: 'grandparent', newPhone: '', newIdLast4: '',
+  idPhotoUrl: '', validFrom: '', validUntil: '', newTime: '17:00', reason: ''
 })
 function openChange(c: Child, type: 'person' | 'time') {
+  const t = todayStamps()
   Object.assign(changeForm, {
     open: true, childId: c.id, childName: c.name, changeType: type,
     newPersonName: '', newRelation: 'grandparent', newPhone: '', newIdLast4: '',
+    idPhotoUrl: '', validFrom: t.from, validUntil: t.until,
     newTime: pickup(c.id)?.scheduledTime || '17:00', reason: ''
   })
 }
 async function submitChange() {
-  if (changeForm.changeType === 'person' && !changeForm.newPersonName) { ui.show('请填写接送人姓名', 'err'); return }
-  await api.pickupChange({ ...changeForm, requestedBy: auth.user?.name })
+  const body: any = { childId: changeForm.childId, changeType: changeForm.changeType, requestedBy: auth.user?.name }
+  if (changeForm.changeType === 'person') {
+    if (!changeForm.newPersonName.trim()) { ui.show('请填写接送人姓名', 'err'); return }
+    if (!changeForm.idPhotoUrl) { ui.show('请上传身份证照片', 'err'); return }
+    if (!changeForm.reason.trim()) { ui.show('请填写接送原因', 'err'); return }
+    Object.assign(body, {
+      newPersonName: changeForm.newPersonName,
+      newRelation: changeForm.newRelation,
+      newPhone: changeForm.newPhone,
+      newIdLast4: changeForm.newIdLast4,
+      idPhotoUrl: changeForm.idPhotoUrl,
+      // datetime-local('YYYY-MM-DDTHH:MM') → 服务端要求 'YYYY-MM-DD HH:MM'
+      validFrom: changeForm.validFrom.replace('T', ' '),
+      validUntil: changeForm.validUntil.replace('T', ' '),
+      reason: changeForm.reason
+    })
+  } else {
+    body.newTime = changeForm.newTime
+    body.reason = changeForm.reason
+  }
+  await api.pickupChange(body)
   changeForm.open = false
   ui.show('申请已提交，等待班主任核身批准')
 }

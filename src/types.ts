@@ -31,9 +31,13 @@ export interface AuthorizedPerson {
   phone?: string | null
   idLast4?: string | null
   pin: string
+  photoUrl?: string | null
   active: number
   status: string
+  validFrom?: string | null
   validUntil?: string | null
+  source?: string | null
+  grantedBy?: string | null
 }
 
 export interface MedicineItem { name: string; dose: string; time: string }
@@ -118,10 +122,11 @@ export interface Pickup {
   photoUrl?: string | null
   pinVerified: number
   isLate: number
-  status: 'planned' | 'picked' | 'cancelled' | 'replaced'
+  status: 'planned' | 'picked' | 'cancelled' | 'replaced' | 'expired'
   createdAt: string
   createdVia: string
   syncedAt?: string | null
+  confirmedBy?: string | null
 }
 
 export interface GateLog {
@@ -148,6 +153,9 @@ export interface PickupChange {
   newPin?: string | null
   newTime?: string | null
   reason?: string
+  idPhotoUrl?: string | null
+  validFrom?: string | null
+  validUntil?: string | null
   status: 'pending' | 'approved' | 'rejected'
   requestedBy?: string
   approvedBy?: string | null

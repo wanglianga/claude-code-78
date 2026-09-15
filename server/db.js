@@ -300,6 +300,23 @@ CREATE TABLE IF NOT EXISTS gate_offline_permits (
 );
 `)
 
+// 旧版本库结构的幂等列迁移（CREATE TABLE IF NOT EXISTS 不会补列）
+function addColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name)
+  if (!cols.includes(column)) db.prepare(`ALTER TABLE ${table} ADD COLUMN ${ddl}`).run()
+}
+// 临时授权接送：证件照片、有效起止时间、来源与核身批准人
+addColumn('pickup_changes', 'id_photo_url', 'id_photo_url TEXT')
+addColumn('pickup_changes', 'valid_from', 'valid_from TEXT')
+addColumn('pickup_changes', 'valid_until', 'valid_until TEXT')
+// 授权人有效期窗口（NULL=常驻长期授权）与来源
+addColumn('authorized_persons', 'valid_from', 'valid_from TEXT')
+addColumn('authorized_persons', 'valid_until', 'valid_until TEXT')
+addColumn('authorized_persons', 'source', "source TEXT DEFAULT '常驻授权'")
+addColumn('authorized_persons', 'granted_by', 'granted_by TEXT')
+// 接送落库时的门卫确认人（在线=登录门卫，离线补传=离线许可持有门卫）
+addColumn('pickups', 'confirmed_by', 'confirmed_by TEXT')
+
 export function nowStr() {
   return new Date().toISOString()
 }
