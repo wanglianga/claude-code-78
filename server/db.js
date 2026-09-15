@@ -1,0 +1,292 @@
+import Database from 'better-sqlite3'
+import { mkdirSync } from 'node:fs'
+
+const DATA_DIR = process.env.DATA_DIR || '/data'
+mkdirSync(DATA_DIR, { recursive: true })
+
+export const db = new Database(`${DATA_DIR}/app.db`)
+db.pragma('journal_mode = WAL')
+db.pragma('foreign_keys = ON')
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,            -- health | teacher | guard | principal | parent
+  phone TEXT,
+  class_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS parent_links (
+  user_id TEXT NOT NULL,
+  child_id TEXT NOT NULL,
+  UNIQUE(user_id, child_id)
+);
+
+CREATE TABLE IF NOT EXISTS classes (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  sort INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS children (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  class_id TEXT NOT NULL,
+  emoji TEXT DEFAULT '🧒',
+  bus_route TEXT
+);
+
+CREATE TABLE IF NOT EXISTS authorized_persons (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  relation TEXT NOT NULL,         -- parent | grandparent | nanny | temporary
+  phone TEXT,
+  id_last4 TEXT,
+  pin TEXT NOT NULL,              -- 4 位接送授权码
+  photo_url TEXT,
+  active INTEGER DEFAULT 1,
+  status TEXT DEFAULT 'active',   -- active | pending
+  valid_until TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS health_checks (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  temperature REAL,
+  cough INTEGER DEFAULT 0,
+  rash INTEGER DEFAULT 0,
+  medicine TEXT,                  -- 自带药品说明 JSON
+  breakfast TEXT,
+  mood TEXT,
+  special_items TEXT,
+  conclusion TEXT,                -- admit | observe | home
+  note TEXT,
+  by_user TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE(child_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS class_decisions (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  action TEXT NOT NULL,           -- join | observe | home
+  observe_until TEXT,
+  note TEXT,
+  by_user TEXT,
+  created_at TEXT,
+  UNIQUE(child_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS med_plans (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  med_name TEXT NOT NULL,
+  dose TEXT,
+  planned_time TEXT NOT NULL,
+  actual_time TEXT,
+  status TEXT DEFAULT 'pending',  -- pending | done | skipped
+  by_user TEXT,
+  note TEXT,
+  source TEXT DEFAULT 'morning',  -- morning | manual
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+  id TEXT PRIMARY KEY,
+  client_id TEXT UNIQUE,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  type TEXT NOT NULL,             -- fever | nap | rash | diet | other
+  content TEXT NOT NULL,
+  severity TEXT DEFAULT 'info',   -- info | warn | alert
+  by_user TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS care_transfers (
+  id TEXT PRIMARY KEY,
+  client_id TEXT UNIQUE,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  from_class_id TEXT NOT NULL,
+  to_class_id TEXT NOT NULL,
+  reason TEXT,
+  start_time TEXT NOT NULL,
+  end_time TEXT,
+  status TEXT DEFAULT 'active',   -- active | returned
+  by_user TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pickups (
+  id TEXT PRIMARY KEY,
+  client_id TEXT UNIQUE,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  person_id TEXT,
+  person_name TEXT,
+  relation TEXT,
+  method TEXT DEFAULT 'walk',     -- walk | bus
+  scheduled_time TEXT,
+  actual_time TEXT,
+  photo_url TEXT,
+  pin_verified INTEGER DEFAULT 0,
+  is_late INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'planned',  -- planned | picked | cancelled | replaced
+  created_via TEXT DEFAULT 'online',
+  synced_at TEXT,
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pickups_date ON pickups(date);
+
+CREATE TABLE IF NOT EXISTS gate_logs (
+  id TEXT PRIMARY KEY,
+  client_id TEXT UNIQUE,
+  child_id TEXT,
+  child_name TEXT,
+  person_name TEXT,
+  result TEXT NOT NULL,           -- pass | denied
+  reason TEXT,
+  created_via TEXT DEFAULT 'online',
+  synced_at TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pickup_changes (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  change_type TEXT NOT NULL,      -- person | time
+  old_person_id TEXT,
+  new_person_id TEXT,
+  new_person_name TEXT,
+  new_relation TEXT,
+  new_phone TEXT,
+  new_id_last4 TEXT,
+  new_pin TEXT,
+  new_time TEXT,
+  reason TEXT,
+  status TEXT DEFAULT 'pending',  -- pending | approved | rejected
+  requested_by TEXT,
+  approved_by TEXT,
+  created_at TEXT,
+  handled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bus_records (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  route TEXT,
+  board_morning TEXT,
+  alight_morning TEXT,
+  board_evening TEXT,
+  alight_evening TEXT,
+  escort_teacher TEXT,
+  updated_by TEXT,
+  UNIQUE(child_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS activities (
+  id TEXT PRIMARY KEY,
+  class_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  name TEXT NOT NULL,
+  start_time TEXT,
+  end_time TEXT,
+  location TEXT,
+  created_by TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS disease_alerts (
+  id TEXT PRIMARY KEY,
+  class_id TEXT NOT NULL,
+  disease_name TEXT NOT NULL,
+  since_date TEXT NOT NULL,
+  status TEXT DEFAULT 'active',    -- active | lifted
+  note TEXT,
+  created_by TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS teacher_handovers (
+  id TEXT PRIMARY KEY,
+  class_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  shift TEXT,
+  from_teacher TEXT NOT NULL,
+  to_teacher TEXT NOT NULL,
+  handover_time TEXT NOT NULL,
+  content TEXT,
+  children_count INTEGER,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS communications (
+  id TEXT PRIMARY KEY,
+  child_id TEXT,
+  class_id TEXT,
+  channel TEXT DEFAULT 'app',
+  from_user TEXT,
+  from_name TEXT,
+  to_role TEXT,
+  content TEXT NOT NULL,
+  acked INTEGER DEFAULT 0,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+  id TEXT PRIMARY KEY,
+  child_id TEXT,
+  class_id TEXT,
+  type TEXT NOT NULL,              -- fever | symptom | med | nap | pickup_change | late | disease | transfer | approval
+  title TEXT NOT NULL,
+  message TEXT,
+  severity TEXT DEFAULT 'warn',    -- info | warn | critical
+  for_roles TEXT DEFAULT '*',      -- 逗号分隔，* 为所有角色
+  status TEXT DEFAULT 'open',      -- open | resolved
+  created_at TEXT,
+  resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_confirmations (
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  confirmed_by TEXT,
+  confirmed_at TEXT,
+  UNIQUE(child_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS sync_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+`)
+
+export function nowStr() {
+  return new Date().toISOString()
+}
+
+export function nowHHMM() {
+  return new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit' })
+}
+
+export function todayStr() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
+}
+
+let counter = 0
+export function uid(prefix = 'id') {
+  counter = (counter + 1) % 1_000_000
+  const rand = Math.random().toString(36).slice(2, 8)
+  return `${prefix}_${Date.now().toString(36)}${counter.toString(36)}${rand}`
+}

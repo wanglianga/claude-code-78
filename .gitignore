@@ -1,0 +1,32 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+
+# Local runtime data and configuration
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Editor, temporary, and QA artifacts
+.DS_Store
+*.tmp
+*.temp
+output/
+.playwright-cli/
+
+# Local agent configuration and exported trajectories
+CLAUDE.md
+.claude/
+.codex/
+memory/
+skill/
+skills/
+*_traces/
+*.jsonl

@@ -1,0 +1,26 @@
+services:
+  app:
+    build: .
+    image: kindergarten-care-platform:latest
+    container_name: ${COMPOSE_PROJECT_NAME}-app
+    restart: unless-stopped
+    ports:
+      - "${CC_PUBLISH_PORT}:4000"
+    environment:
+      PORT: 4000
+      DATA_DIR: /data
+      # 晚接判定时间（超过即预警）
+      PICKUP_DEADLINE: "17:30"
+      # 演示用种子开关：首次启动空库时写入演示数据
+      SEED_ON_EMPTY: "true"
+    volumes:
+      - app-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  app-data:
