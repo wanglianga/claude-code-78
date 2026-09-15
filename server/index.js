@@ -94,6 +94,50 @@ function childClass(childId) {
   return one('SELECT class_id AS classId FROM children WHERE id=?', childId)?.classId || null
 }
 
+// 家长绑定幼儿集合（不信任客户端传入的关系）
+function linkedChildIds(userId) {
+  return new Set(db.prepare('SELECT child_id AS c FROM parent_links WHERE user_id=?').all(userId).map(r => r.c))
+}
+
+// 会话可见范围：家长仅绑定幼儿；班主任仅本班；保健/门卫/园长为全园
+// canSeeSensitive=true 的角色才下发临时授权码与身份证照片：关联家长、本班教师、园长
+function roleScope(user) {
+  const childIds = new Set()
+  const classIds = new Set()
+  let allChildren = false
+  if (user.role === 'parent') {
+    linkedChildIds(user.id).forEach(id => childIds.add(id))
+    for (const cid of childIds) {
+      const c = db.prepare('SELECT class_id FROM children WHERE id=?').get(cid)
+      if (c) classIds.add(c.class_id)
+    }
+  } else if (user.role === 'teacher') {
+    if (user.classId) classIds.add(user.classId)
+    db.prepare('SELECT id FROM children WHERE class_id=?').all(user.classId).forEach(c => childIds.add(c.id))
+  } else {
+    allChildren = true
+    db.prepare('SELECT id FROM children').all().forEach(c => childIds.add(c.id))
+    db.prepare('SELECT id FROM classes').all().forEach(c => classIds.add(c.id))
+  }
+  const sensitiveRoles = user.role === 'parent' || user.role === 'teacher' || user.role === 'principal'
+  return { role: user.role, childIds, classIds, allChildren, canSeeSensitive: sensitiveRoles }
+}
+
+// 幼儿是否在会话可操作范围内（临时改接申请）
+function canRequestChange(user, childId) {
+  if (user.role === 'principal') return true
+  if (user.role === 'teacher') return childClass(childId) === user.classId
+  if (user.role === 'parent') return linkedChildIds(user.id).has(childId)
+  return false
+}
+
+// 幼儿是否可由该会话核身审批（本班班主任或园长）
+function canApproveChild(user, childId) {
+  if (user.role === 'principal') return true
+  if (user.role === 'teacher') return childClass(childId) === user.classId
+  return false
+}
+
 const ROLES_ALL = 'health,teacher,guard,principal,parent'
 
 // ---------- 健康检查 / 静态资源 ----------
@@ -127,36 +171,79 @@ app.get('/events', (req, res) => {
   sseHandler(req, res)
 })
 
-// ---------- 全量快照（所有端拉同一份，配合 SSE 保证实时一致）----------
-app.get('/api/state', (_req, res) => {
+// ---------- 全量快照（按会话角色裁剪范围与敏感字段，配合 SSE 保证实时一致）----------
+app.get('/api/state', (req, res) => {
   const date = today()
   // 到期临时授权自动恢复原名单（门卫端每次刷新/事件触发都会看到最新状态）
   if (sweepExpiredTemporary()) broadcast('expired')
+
+  const scope = roleScope(req.user)
+  const inScope = (childId) => scope.allChildren || scope.childIds.has(childId)
+
+  let children = all('SELECT * FROM children').filter(c => inScope(c.id))
+  let pickups = all('SELECT * FROM pickups WHERE date=? ORDER BY scheduled_time, created_at', date)
+    .filter(p => inScope(p.childId))
+  let authorizedPersons = all('SELECT * FROM authorized_persons ORDER BY active DESC, created_at')
+    .filter(p => inScope(p.childId))
+  // 临时授权记录：门卫/保健不需要；教师/园长/家长仅见本班或本人绑定幼儿的
+  let pickupChanges = scope.canSeeSensitive
+    ? all('SELECT * FROM pickup_changes WHERE date=? ORDER BY created_at DESC', date).filter(pc => inScope(pc.childId))
+    : []
+
+  if (!scope.canSeeSensitive) {
+    // 保健老师：可见授权关系但不需要 PIN/证件照
+    authorizedPersons = authorizedPersons.map(p => {
+      const { pin, photoUrl, ...rest } = p
+      return rest
+    })
+  }
+  if (scope.role === 'guard') {
+    // 门卫仅保留核验所需：id/childId/姓名/关系/有效期/来源/状态；绝不下发 PIN、身份证照片、手机、证件尾号
+    authorizedPersons = authorizedPersons.map(p => ({
+      id: p.id, childId: p.childId, name: p.name, relation: p.relation,
+      active: p.active, status: p.status,
+      validFrom: p.validFrom, validUntil: p.validUntil, source: p.source
+    }))
+    // 门卫大屏不需要接送留影（照片只用于档案与家长确认）
+    pickups = pickups.map(p => { const { photoUrl, ...rest } = p; return rest })
+  }
+
   res.json({
     serverTime: nowStr(),
     clockHHMM: nowHHMM(),
     date,
     deadline: DEADLINE,
-    users: all(`SELECT id,username,name,role,phone,class_id AS classId FROM users`),
+    // 用户目录仅保留展示所需，不含手机号等
+    users: all(`SELECT id,username,name,role,class_id AS classId FROM users`),
     classes: all('SELECT * FROM classes ORDER BY sort'),
-    children: all('SELECT * FROM children'),
-    parentLinks: all('SELECT user_id AS userId, child_id AS childId FROM parent_links'),
-    authorizedPersons: all('SELECT * FROM authorized_persons WHERE active=1 ORDER BY created_at'),
-    healthChecks: all('SELECT * FROM health_checks WHERE date=?', date),
-    classDecisions: all('SELECT * FROM class_decisions WHERE date=?', date),
-    medPlans: all('SELECT * FROM med_plans WHERE date=? ORDER BY planned_time', date),
-    observations: all('SELECT * FROM observations WHERE date=? ORDER BY created_at', date),
-    careTransfers: all('SELECT * FROM care_transfers WHERE date=? ORDER BY start_time', date),
-    pickups: all('SELECT * FROM pickups WHERE date=? ORDER BY scheduled_time, created_at', date),
-    gateLogs: all('SELECT * FROM gate_logs WHERE date(created_at)=? ORDER BY created_at DESC LIMIT 50', date),
-    pickupChanges: all('SELECT * FROM pickup_changes WHERE date=? ORDER BY created_at DESC', date),
-    busRecords: all('SELECT * FROM bus_records WHERE date=?', date),
-    activities: all('SELECT * FROM activities WHERE date=? ORDER BY start_time', date),
+    children,
+    parentLinks: scope.role === 'parent'
+      ? all('SELECT user_id AS userId, child_id AS childId FROM parent_links WHERE user_id=?', req.user.id)
+      : all('SELECT user_id AS userId, child_id AS childId FROM parent_links'),
+    authorizedPersons,
+    healthChecks: all('SELECT * FROM health_checks WHERE date=?', date).filter(h => inScope(h.childId)),
+    classDecisions: all('SELECT * FROM class_decisions WHERE date=?', date).filter(d => inScope(d.childId)),
+    medPlans: all('SELECT * FROM med_plans WHERE date=? ORDER BY planned_time', date).filter(m => inScope(m.childId)),
+    observations: all('SELECT * FROM observations WHERE date=? ORDER BY created_at', date).filter(o => inScope(o.childId)),
+    careTransfers: all('SELECT * FROM care_transfers WHERE date=? ORDER BY start_time', date).filter(t => inScope(t.childId)),
+    pickups,
+    gateLogs: all('SELECT * FROM gate_logs WHERE date(created_at)=? ORDER BY created_at DESC LIMIT 50', date)
+      .filter(g => scope.allChildren || (g.childId && inScope(g.childId))),
+    pickupChanges,
+    busRecords: all('SELECT * FROM bus_records WHERE date=?', date).filter(b => inScope(b.childId)),
+    activities: scope.allChildren
+      ? all('SELECT * FROM activities WHERE date=? ORDER BY start_time', date)
+      : all('SELECT * FROM activities WHERE date=? ORDER BY start_time', date).filter(a => scope.classIds.has(a.classId)),
     diseaseAlerts: all("SELECT * FROM disease_alerts WHERE status='active' ORDER BY since_date DESC"),
-    teacherHandovers: all('SELECT * FROM teacher_handovers WHERE date=? ORDER BY handover_time DESC', date),
-    communications: all('SELECT * FROM communications WHERE date(created_at)=? ORDER BY created_at DESC LIMIT 100', date),
-    alerts: all("SELECT * FROM alerts WHERE status='open' OR date(created_at)=? ORDER BY created_at DESC LIMIT 100", date),
-    confirmations: all('SELECT * FROM daily_confirmations WHERE date=?', date)
+    teacherHandovers: scope.allChildren
+      ? all('SELECT * FROM teacher_handovers WHERE date=? ORDER BY handover_time DESC', date)
+      : all('SELECT * FROM teacher_handovers WHERE date=? ORDER BY handover_time DESC', date).filter(h => scope.classIds.has(h.classId)),
+    communications: all('SELECT * FROM communications WHERE date(created_at)=? ORDER BY created_at DESC LIMIT 100', date)
+      .filter(m => (m.childId && inScope(m.childId)) || (m.classId && scope.classIds.has(m.classId))),
+    alerts: all("SELECT * FROM alerts WHERE status='open' OR date(created_at)=? ORDER BY created_at DESC LIMIT 100", date)
+      .filter(a => scope.allChildren ||
+        (a.childId ? inScope(a.childId) : a.classId ? scope.classIds.has(a.classId) : true)),
+    confirmations: all('SELECT * FROM daily_confirmations WHERE date=?', date).filter(c => inScope(c.childId))
   })
 })
 
@@ -435,7 +522,7 @@ function issueVerification({ personId, pin, guardName }) {
   return {
     token,
     person: {
-      id: person.id, name: person.name, relation: person.relation, phone: person.phone,
+      id: person.id, name: person.name, relation: person.relation,
       source: person.source, validUntil: person.validUntil
     },
     child: { id: child.id, name: child.name, classId: child.class_id }
@@ -570,6 +657,15 @@ app.post('/api/gate/deny', requireRole('guard'), wrap((req, res) => {
 app.post('/api/pickup-changes', (req, res) => {
   const b = req.body || {}
   if (!b.childId) return res.status(400).json({ error: '缺少幼儿标识' })
+  const child = db.prepare('SELECT id FROM children WHERE id=?').get(b.childId)
+  if (!child) return res.status(404).json({ error: '幼儿不存在' })
+  // 主体范围：仅绑定该幼儿的家长、本班班主任、园长可发起；其他角色（含其他班家长/门卫/保健）一律 403
+  if (!['parent', 'teacher', 'principal'].includes(req.user.role)) {
+    return res.status(403).json({ error: '无权发起接送变更申请' })
+  }
+  if (!canRequestChange(req.user, b.childId)) {
+    return res.status(403).json({ error: '只能为与您绑定的幼儿申请临时接送' })
+  }
   const changeType = b.changeType === 'time' ? 'time' : 'person'
 
   let idPhoto = null
@@ -611,11 +707,11 @@ app.post('/api/pickup-changes', (req, res) => {
       b.newPin || null, b.newTime || null, b.reason || '', idPhoto, validFrom, validUntil,
       `${req.user.name}（${{ parent: '家长', teacher: '班主任', principal: '园长', guard: '门卫', health: '保健' }[req.user.role] || req.user.role}）`,
       nowStr())
-  const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', b.childId)
+  const childInfo = one('SELECT name, class_id AS classId FROM children WHERE id=?', b.childId)
   pushAlert({
-    type: 'pickup_change', childId: b.childId, classId: child?.classId, severity: 'warn',
+    type: 'pickup_change', childId: b.childId, classId: childInfo?.classId, severity: 'warn',
     forRoles: 'teacher,guard,principal,parent',
-    title: `临时${changeType === 'time' ? '改时间' : '改接'}申请：${child?.name}`,
+    title: `临时${changeType === 'time' ? '改时间' : '改接'}申请：${childInfo?.name}`,
     message: changeType === 'time'
       ? `申请改为 ${b.newTime} 接（${b.reason || ''}），待审批`
       : `申请人「${b.newPersonName}」（${{ grandparent: '祖辈', nanny: '保姆', temporary: '临时授权人', parent: '家长' }[b.newRelation]}），有效期 ${validFrom?.slice(11)}–${validUntil?.slice(11)}，已交身份证照片，待班主任核身；审批前门卫端不放行`
@@ -627,6 +723,10 @@ app.post('/api/pickup-changes', (req, res) => {
 app.post('/api/pickup-changes/:id/approve', requireRole('teacher', 'principal'), wrap((req, res) => {
   const pc = one('SELECT * FROM pickup_changes WHERE id=?', req.params.id)
   if (!pc || pc.status !== 'pending') throw new GateError(400, '申请不存在或已处理')
+  // 仅该幼儿所属班级班主任或园长可核身批准，其他班教师 403
+  if (!canApproveChild(req.user, pc.childId)) {
+    throw new GateError(403, '无权审批其他班级幼儿的接送变更')
+  }
   const date = today()
   const byUser = req.user.name
 
@@ -681,6 +781,9 @@ app.post('/api/pickup-changes/:id/approve', requireRole('teacher', 'principal'),
 app.post('/api/pickup-changes/:id/reject', requireRole('teacher', 'principal'), wrap((req, res) => {
   const pc = one('SELECT * FROM pickup_changes WHERE id=?', req.params.id)
   if (!pc || pc.status !== 'pending') throw new GateError(400, '申请不存在或已处理')
+  if (!canApproveChild(req.user, pc.childId)) {
+    throw new GateError(403, '无权驳回其他班级幼儿的接送变更')
+  }
   const byUser = req.user.name
   db.prepare(`UPDATE pickup_changes SET status='rejected', approved_by=?, handled_at=? WHERE id=?`)
     .run(byUser, nowStr(), req.params.id)

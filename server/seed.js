@@ -24,7 +24,9 @@ export function seed() {
     ['u_guard', 'guard', '陈门卫', 'guard', '13800000004', null],
     ['u_principal', 'principal', '刘园长', 'principal', '13800000005', null],
     ['u_parent1', 'parent1', '李妈妈', 'parent', '13900000001', null],
-    ['u_parent2', 'parent2', '张爸爸', 'parent', '13900000002', null]
+    ['u_parent2', 'parent2', '张爸爸', 'parent', '13900000002', null],
+    ['u_parent3', 'parent3', '陈妈妈', 'parent', '13900000003', null],
+    ['u_parent4', 'parent4', '周妈妈', 'parent', '13900000004', null]
   ]
   const insUser = db.prepare('INSERT INTO users (id,username,password,name,role,phone,class_id) VALUES (?,?,?,?,?,?,?)')
   users.forEach(u => insUser.run(u[0], u[1], '123456', u[2], u[3], u[4], u[5]))
@@ -32,8 +34,8 @@ export function seed() {
   const children = [
     { id: 'c_lele', name: '李乐乐', class_id: 'cls_sunflower', emoji: '🧒', bus_route: 'A线', parent: 'u_parent1' },
     { id: 'c_duoduo', name: '张朵朵', class_id: 'cls_sunflower', emoji: '👧', bus_route: null, parent: 'u_parent2' },
-    { id: 'c_kangkang', name: '周康康', class_id: 'cls_littlebee', emoji: '👦', bus_route: 'B线', parent: null },
-    { id: 'c_an_an', name: '陈安安', class_id: 'cls_littlebee', emoji: '🧒', bus_route: null, parent: null }
+    { id: 'c_kangkang', name: '周康康', class_id: 'cls_littlebee', emoji: '👦', bus_route: 'B线', parent: 'u_parent4' },
+    { id: 'c_an_an', name: '陈安安', class_id: 'cls_littlebee', emoji: '🧒', bus_route: null, parent: 'u_parent3' }
   ]
   const insChild = db.prepare('INSERT INTO children (id,name,class_id,emoji,bus_route) VALUES (?,?,?,?,?)')
   const insLink = db.prepare('INSERT INTO parent_links (user_id,child_id) VALUES (?,?)')

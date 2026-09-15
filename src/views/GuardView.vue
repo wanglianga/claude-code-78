@@ -73,7 +73,7 @@
                     <select v-model="off.personId">
                       <option value="" disabled>请选择</option>
                       <option v-for="p in offlinePersons" :key="p.id" :value="p.id">
-                        {{ p.name }}（{{ relationLabel[p.relation] }} · 证件尾号 {{ p.idLast4 || '—' }}）{{ p.validUntil ? ` ·临时至${p.validUntil.slice(11)}` : '' }}
+                        {{ p.name }}（{{ relationLabel[p.relation] }}）{{ p.validUntil ? ` ·临时至${p.validUntil.slice(11)}` : '' }}
                       </option>
                     </select>
                   </label>
@@ -96,7 +96,7 @@
             <div class="pass-title">✅ 身份核验通过</div>
             <dl class="kv">
               <dt>幼儿</dt><dd><b>{{ child?.name }}</b>（{{ shortClass(child?.classId) }}）</dd>
-              <dt>接送人</dt><dd>{{ verified.person.name }} · {{ relationLabel[verified.person.relation] }} · {{ verified.person.phone || '—' }}</dd>
+              <dt>接送人</dt><dd>{{ verified.person.name }} · {{ relationLabel[verified.person.relation] }}</dd>
               <dt>授权来源</dt><dd><b class="source-text">{{ verified.person.source || '常驻授权' }}</b></dd>
               <dt v-if="verified.person.validUntil">有效期</dt>
               <dd v-if="verified.person.validUntil">至 {{ String(verified.person.validUntil).slice(11) }}（到期不可再刷）</dd>
@@ -244,7 +244,7 @@ const child = ref<Child | null>(null)
 const pin = ref('')
 const verifyErr = ref('')
 // 服务端签发的一次性放行结果（令牌 + 服务端返回的接送人信息）
-const verified = ref<{ token: string; person: { id: string; name: string; relation: string; phone?: string; source?: string; validUntil?: string | null } } | null>(null)
+const verified = ref<{ token: string; person: { id: string; name: string; relation: string; source?: string; validUntil?: string | null } } | null>(null)
 const photoUrl = ref('')
 const denyOpen = ref(false)
 const off = ref({ personId: '', photoUrl: '' })
