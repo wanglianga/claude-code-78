@@ -85,6 +85,45 @@
         <p v-if="!myMeds.length" class="muted small">今日本班无用药计划</p>
       </div>
 
+      <!-- 发热隔离同班观察待办 -->
+      <div v-for="fi in myActiveIsolations" :key="fi.id" class="card" style="border-left:4px solid var(--red)">
+        <h3>🌡️ 同班观察待办：{{ childName(fi.childId) }} {{ fi.temperature }}℃ 已入{{ fi.isolationRoom }}</h3>
+        <p class="small muted">
+          请逐一记录同班其他儿童的<b>咳嗽、缺勤、家长反馈</b>，结果同步保健并影响次日晨检与消毒安排。
+          <span v-if="fi.classContact">接触情况：{{ fi.classContact }}</span>
+        </p>
+        <table class="tbl">
+          <thead><tr><th>同班儿童</th><th>咳嗽</th><th>缺勤</th><th>体温</th><th>家长反馈</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="c in classmatesOf(fi)" :key="c.id">
+              <td>{{ c.emoji }} {{ c.name }}</td>
+              <td>
+                <button class="chip btn-sm" :class="{ 'on-red': coForm(fi.id, c.id).cough }" @click="coForm(fi.id, c.id).cough = !coForm(fi.id, c.id).cough">咳嗽</button>
+              </td>
+              <td>
+                <button class="chip btn-sm" :class="{ 'on': coForm(fi.id, c.id).absent }" @click="coForm(fi.id, c.id).absent = !coForm(fi.id, c.id).absent">缺勤</button>
+              </td>
+              <td><input v-model="coForm(fi.id, c.id).temperature" type="number" step="0.1" placeholder="选填" style="width:78px" /></td>
+              <td><input v-model="coForm(fi.id, c.id).parentFeedback" placeholder="家长反馈（选填）" /></td>
+            </tr>
+          </tbody>
+        </table>
+        <button class="btn btn-primary btn-sm" style="margin-top:8px" @click="submitClassmate(fi)">提交同班观察</button>
+      </div>
+
+      <!-- 本班消毒安排 -->
+      <div v-if="mySanitation.length" class="card">
+        <h3>🧴 本班消毒安排（已通知保育员）</h3>
+        <div v-for="sp in mySanitation" :key="sp.id" class="transfer-item">
+          <span class="badge" :class="sp.status === 'done' ? 'badge-green' : 'badge-amber'">
+            {{ sp.status === 'done' ? '已消毒' : '待消毒' }}
+          </span>
+          <b>{{ sp.dueTime }} 前</b> {{ sp.scope }}
+          <span class="muted small">{{ sp.reason }}｜{{ sp.notifiedCleaner }}</span>
+          <span v-if="sp.doneAt" class="small green">{{ sp.doneAt }} {{ sp.doneBy }} 完成，已入班级记录</span>
+        </div>
+      </div>
+
       <div class="card">
         <h3>📝 今日异常观察（发热/午睡/皮疹…实时同步保健、园长、家长）</h3>
         <div v-for="o in myObservations" :key="o.id" class="obs-item">
@@ -318,6 +357,37 @@ const myObservations = computed(() =>
 const transfersAll = computed(() =>
   data.state.careTransfers.filter(t => t.fromClassId === myClassId.value || t.toClassId === myClassId.value))
 const otherClasses = computed(() => data.state.classes.filter(c => c.id !== myClassId.value))
+// 本班相关、未解除的发热隔离（含隔离幼儿本身属于本班的）
+const myActiveIsolations = computed(() =>
+  data.state.feverIsolations.filter(fi =>
+    childClassOf(fi.childId) === myClassId.value && fi.status !== 'released'))
+function childClassOf(childId: string) {
+  return data.childById(childId)?.classId
+}
+// 同班观察对象：排除被隔离幼儿本人
+function classmatesOf(fi: any) {
+  return myChildren.value.filter(c => c.id !== fi.childId)
+}
+// 每个隔离 × 每名同班儿童的观察表单（用已提交数据初始化）
+const coForms = reactive<Record<string, any>>({})
+function coForm(isoId: string, childId: string) {
+  const key = `${isoId}|${childId}`
+  if (!coForms[key]) {
+    const saved = data.state.classmateObservations.find(co => co.isolationId === isoId && co.childId === childId)
+    coForms[key] = reactive({
+      cough: !!saved?.cough, absent: !!saved?.absent,
+      temperature: saved?.temperature ?? '', parentFeedback: saved?.parentFeedback || ''
+    })
+  }
+  return coForms[key]
+}
+async function submitClassmate(fi: any) {
+  const items = classmatesOf(fi).map(c => ({ childId: c.id, ...coForm(fi.id, c.id) }))
+  const r = await api.classmateObservations({ isolationId: fi.id, items })
+  ui.show(`同班观察已提交，异常 ${r.abnormalCount} 名，已影响次日晨检`)
+}
+const mySanitation = computed(() =>
+  data.state.sanitationPlans.filter(sp => sp.classId === myClassId.value))
 const myHandovers = computed(() =>
   data.state.teacherHandovers.filter(h => h.classId === myClassId.value))
 const myActivities = computed(() =>

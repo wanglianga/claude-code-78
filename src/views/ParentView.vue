@@ -32,6 +32,21 @@
         <span v-if="dec[c.id].note" class="muted">（{{ dec[c.id].note }}）</span>
       </div>
 
+      <!-- 发热隔离与就医建议 -->
+      <div v-if="isolation(c.id)" class="sub iso-box">
+        <h4>🏥 园内发热隔离{{ isolation(c.id)!.status === 'released' ? '（已解除）' : '' }}</h4>
+        <div class="iso-line">
+          <span class="badge badge-red">{{ isolation(c.id)!.temperature }}℃</span>
+          <span v-for="s in isolation(c.id)!.symptoms" :key="s" class="badge badge-amber">{{ s }}</span>
+          <span class="muted small">{{ isolation(c.id)!.startTime }} 入{{ isolation(c.id)!.isolationRoom }}</span>
+          <span class="muted small">家长通知 {{ isolation(c.id)!.parentNotifiedAt || '—' }}</span>
+        </div>
+        <div v-if="isolation(c.id)!.medicalAdvice" class="advice-box">
+          <b>🩺 带回就医建议（{{ isolation(c.id)!.adviceBy }} {{ isolation(c.id)!.adviceAt }}）：</b>
+          {{ isolation(c.id)!.medicalAdvice }}
+        </div>
+      </div>
+
       <!-- 用药与异常 -->
       <div v-if="meds(c.id).length" class="sub">
         <h4>💊 今日用药</h4>
@@ -202,6 +217,9 @@ const shortClass = (id?: string | null) => data.className(id).split(' · ')[0]
 const meds = (id: string) => data.state.medPlans.filter(m => m.childId === id)
 const obs = (id: string) => data.state.observations.filter(o => o.childId === id)
 const transfer = (id: string) => data.activeTransferByChild[id]
+const isolation = (id: string) =>
+  [...data.state.feverIsolations].filter(fi => fi.childId === id && fi.date === data.state.date)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
 const pickup = (id: string) => data.effectivePickupByChild[id]
 const persons = (id: string) => data.state.authorizedPersons.filter(p => p.childId === id)
 const regularPersons = (id: string) => persons(id).filter(p => !p.validUntil)
@@ -300,6 +318,9 @@ async function confirm(c: Child) {
 .pin-box { display: inline-block; margin-left: 6px; color: var(--purple); font-weight: 700; }
 .auth-list { margin-top: 8px; }
 .person-line { padding: 3px 0; }
+.iso-box { background: var(--red-bg); border-radius: 12px; padding: 10px 12px; }
+.iso-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.advice-box { background: #fff; border-radius: 8px; padding: 8px 10px; font-size: 13px; line-height: 1.6; }
 .confirm-box { margin-top: 12px; text-align: center; font-size: 13px; color: var(--green); font-weight: 700; }
 .green { color: var(--green); }
 .red { color: var(--red); }

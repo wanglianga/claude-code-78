@@ -1,4 +1,4 @@
-export type Role = 'health' | 'teacher' | 'guard' | 'principal' | 'parent'
+export type Role = 'health' | 'teacher' | 'guard' | 'principal' | 'parent' | 'cleaner'
 
 export interface User {
   id: string
@@ -259,4 +259,60 @@ export interface AppState {
   communications: Communication[]
   alerts: Alert[]
   confirmations: { childId: string; date: string; confirmedBy?: string; confirmedAt?: string }[]
+  feverIsolations: FeverIsolation[]
+  classmateObservations: ClassmateObservation[]
+  sanitationPlans: SanitationPlan[]
+  nextDayMorningFlags: Record<string, { isolatedYesterday?: boolean; abnormalContactYesterday?: boolean }>
+}
+
+export interface FeverIsolation {
+  id: string
+  clientId?: string | null
+  childId: string
+  date: string
+  temperature?: number | null
+  symptoms: string[]
+  isolationRoom?: string
+  startTime: string
+  parentNotifiedAt?: string | null
+  classContact?: string
+  medicalAdvice?: string | null
+  adviceAt?: string | null
+  adviceBy?: string | null
+  released: number
+  releasedAt?: string | null
+  status: 'isolating' | 'advised' | 'released'
+  byUser?: string
+  createdAt: string
+}
+
+export interface ClassmateObservation {
+  id: string
+  isolationId: string
+  classId: string
+  childId: string
+  date: string
+  cough: number
+  absent: number
+  parentFeedback?: string
+  temperature?: number | null
+  abnormal: number
+  byUser?: string
+  createdAt: string
+}
+
+export interface SanitationPlan {
+  id: string
+  classId: string
+  date: string
+  scope?: string
+  reason?: string
+  isolationId?: string | null
+  dueTime?: string | null
+  status: 'pending' | 'done'
+  notifiedCleaner?: string | null
+  doneAt?: string | null
+  doneBy?: string | null
+  createdBy?: string
+  createdAt: string
 }

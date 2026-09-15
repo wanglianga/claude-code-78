@@ -63,10 +63,10 @@ const offline = useOfflineStore()
 const ui = useUiStore()
 
 const roleLabels: Record<string, string> = {
-  health: '保健老师', teacher: '班主任', guard: '门卫', principal: '园长', parent: '家长'
+  health: '保健老师', teacher: '班主任', guard: '门卫', principal: '园长', parent: '家长', cleaner: '保育员'
 }
 const roleIcons: Record<string, string> = {
-  health: '🩺', teacher: '👩‍🏫', guard: '🛡️', principal: '👔', parent: '👨‍👩‍👧'
+  health: '🩺', teacher: '👩‍🏫', guard: '🛡️', principal: '👔', parent: '👨‍👩‍👧', cleaner: '🧹'
 }
 const roleLabel = computed(() => roleLabels[auth.user?.role || ''] || '')
 const roleIcon = computed(() => roleIcons[auth.user?.role || ''] || '👤')

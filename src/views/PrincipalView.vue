@@ -11,6 +11,7 @@
       <div class="card kpi amber"><b>{{ stats.observe }}</b><span>观察中</span></div>
       <div class="card kpi red"><b>{{ stats.home }}</b><span>建议回家/发热</span></div>
       <div class="card kpi purple"><b>{{ activeTransfers.length }}</b><span>跨班托管</span></div>
+      <div class="card kpi purple"><b>{{ activeIsolationCount }}</b><span>发热隔离中</span></div>
       <div class="card kpi red"><b>{{ stats.late }}</b><span>晚接</span></div>
     </div>
 
@@ -24,6 +25,26 @@
           <button class="btn btn-sm" @click="resolve(a)">标记处理</button>
         </div>
         <p v-if="!openAlerts.length" class="muted small">暂无待处理预警</p>
+      </div>
+
+      <div class="card">
+        <h3>🏥 发热隔离与消毒</h3>
+        <div v-for="fi in recentIsolations" :key="fi.id" class="iso-line">
+          <b>{{ childName(fi.childId) }}</b>
+          <span class="badge badge-red">{{ fi.temperature }}℃</span>
+          <span class="muted small">{{ fi.startTime }} {{ fi.isolationRoom }}</span>
+          <span class="badge" :class="fi.status === 'released' ? 'badge-gray' : fi.status === 'advised' ? 'badge-amber' : 'badge-red'">
+            {{ fi.status === 'released' ? '已解除' : fi.status === 'advised' ? '已建议就医' : '隔离中' }}
+          </span>
+          <span v-if="abnormalOf(fi.id)" class="badge badge-red">同班异常 {{ abnormalOf(fi.id) }}</span>
+        </div>
+        <p v-if="!recentIsolations.length" class="muted small">今日无隔离</p>
+        <h4 style="margin-top:12px">🧴 今日消毒</h4>
+        <div v-for="sp in data.state.sanitationPlans.filter(s => s.date === data.state.date)" :key="sp.id" class="iso-line small">
+          <span class="badge" :class="sp.status === 'done' ? 'badge-green' : 'badge-amber'">{{ sp.status === 'done' ? '已消毒' : '待消毒' }}</span>
+          {{ className(sp.classId) }} · {{ sp.scope }}
+          <span v-if="sp.doneAt" class="green">{{ sp.doneAt }} {{ sp.doneBy }}</span>
+        </div>
       </div>
 
       <div class="card">
@@ -182,6 +203,13 @@ const stats = computed(() => {
 })
 
 const openAlerts = computed(() => data.alertsForRole('principal'))
+const activeIsolationCount = computed(() =>
+  data.state.feverIsolations.filter(fi => fi.status !== 'released').length)
+const recentIsolations = computed(() =>
+  data.state.feverIsolations.filter(fi => fi.date === data.state.date).slice(0, 10))
+function abnormalOf(isoId: string) {
+  return data.state.classmateObservations.filter(co => co.isolationId === isoId && co.abnormal).length
+}
 const activeTransfers = computed(() => data.state.careTransfers.filter(t => t.status === 'active'))
 const busChildren = computed(() => data.state.children.filter(c => c.busRoute))
 const bus = (id: string) => data.state.busRecords.find(b => b.childId === id)
@@ -224,7 +252,7 @@ async function markEvening(c: any) {
 </script>
 
 <style scoped>
-.overview-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+.overview-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px; }
 .kpi { text-align: center; padding: 18px 8px; }
 .kpi b { display: block; font-size: 30px; color: var(--blue); }
 .kpi.green b { color: var(--green); }
@@ -239,6 +267,8 @@ async function markEvening(c: any) {
 .obs-line { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px dashed var(--line); flex-wrap: wrap; }
 .disease-line { padding: 10px 0; border-bottom: 1px dashed var(--line); display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .late-line { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px dashed var(--line); }
+.iso-line { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px dashed var(--line); flex-wrap: wrap; }
+.green { color: var(--green); font-weight: 700; }
 @media (max-width: 1000px) {
   .overview-grid { grid-template-columns: repeat(3, 1fr); }
   .two-col { grid-template-columns: 1fr; }

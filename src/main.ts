@@ -8,6 +8,7 @@ import TeacherView from './views/TeacherView.vue'
 import GuardView from './views/GuardView.vue'
 import PrincipalView from './views/PrincipalView.vue'
 import ParentView from './views/ParentView.vue'
+import CleanerView from './views/CleanerView.vue'
 import DailyView from './views/DailyView.vue'
 import { useAuthStore } from './store/auth'
 import './styles.css'
@@ -25,6 +26,7 @@ const router = createRouter({
     { path: '/guard', component: GuardView, meta: { roles: ['guard'] } },
     { path: '/principal', component: PrincipalView, meta: { roles: ['principal'] } },
     { path: '/parent', component: ParentView, meta: { roles: ['parent'] } },
+    { path: '/cleaner', component: CleanerView, meta: { roles: ['cleaner'] } },
     { path: '/daily', component: DailyView, meta: { roles: ['health', 'teacher', 'principal'] } }
   ]
 })

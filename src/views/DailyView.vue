@@ -106,6 +106,54 @@
       </div>
     </div>
 
+    <!-- 发热隔离 / 同班观察 / 消毒（班级记录） -->
+    <div class="card" v-if="feverIsolations.length">
+      <h3>🏥 发热隔离处置记录</h3>
+      <div v-for="fi in feverIsolations" :key="fi.id" class="iso-record">
+        <div class="spread">
+          <b style="font-size:15px">{{ childName(fi.childId) }} · {{ fi.temperature }}℃
+            <span v-for="s in fi.symptoms" :key="s" class="badge badge-amber">{{ s }}</span>
+          </b>
+          <span class="badge" :class="fi.status === 'released' ? 'badge-gray' : 'badge-red'">
+            {{ fi.status === 'released' ? `已解除 ${fi.releasedAt || ''}` : fi.status === 'advised' ? '已建议就医' : '隔离中' }}
+          </span>
+        </div>
+        <dl class="kv" style="margin:6px 0">
+          <dt>隔离室</dt><dd>{{ fi.isolationRoom }} · {{ fi.startTime }} 起（{{ fi.byUser }}）</dd>
+          <dt>通知家长</dt><dd>{{ fi.parentNotifiedAt || '—' }}</dd>
+          <dt>同班接触</dt><dd>{{ fi.classContact || '—' }}</dd>
+          <dt>就医建议</dt><dd>{{ fi.medicalAdvice || '—' }} <span v-if="fi.adviceAt" class="muted">（{{ fi.adviceAt }} {{ fi.adviceBy }}）</span></dd>
+        </dl>
+        <div v-if="classmateObs(fi.id).length" class="co-list">
+          <b class="small">同班观察：</b>
+          <span v-for="co in classmateObs(fi.id)" :key="co.id" class="co-chip" :class="{ ab: co.abnormal }">
+            {{ childName(co.childId) }}{{ co.cough ? '·咳嗽' : '' }}{{ co.absent ? '·缺勤' : '' }}{{ co.temperature ? '·' + co.temperature + '℃' : '' }}{{ co.parentFeedback ? '·反馈:' + co.parentFeedback : '' }}
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" v-if="sanitationPlans.length">
+      <h3>🧴 班级消毒记录（已通知保育员）</h3>
+      <table class="tbl">
+        <thead><tr><th>班级</th><th>范围</th><th>原因</th><th>应完成</th><th>状态</th></tr></thead>
+        <tbody>
+          <tr v-for="sp in sanitationPlans" :key="sp.id">
+            <td><b>{{ className(sp.classId) }}</b></td>
+            <td>{{ sp.scope }}</td>
+            <td class="small muted">{{ sp.reason }}</td>
+            <td>{{ sp.dueTime }}</td>
+            <td>
+              <span class="badge" :class="sp.status === 'done' ? 'badge-green' : 'badge-amber'">
+                {{ sp.status === 'done' ? `${sp.doneAt} ${sp.doneBy} 已完成` : '待消毒' }}
+              </span>
+              <span class="small muted">通知 {{ sp.notifiedCleaner }}</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
     <!-- 当天临时授权档案 -->
     <div class="card">
       <h3>📎 当天临时授权接送档案（后续询问备查）</h3>
@@ -192,6 +240,16 @@ const personById = (pid?: string | null) => data.state.authorizedPersons.find(p 
 const pickupSource = (p: any) => personById(p?.personId)?.source || ''
 const tempAuthorizations = computed(() =>
   [...data.state.pickupChanges].filter(pc => pc.changeType === 'person').reverse())
+const feverIsolations = computed(() =>
+  data.state.feverIsolations.filter(fi => !classFilter.value || childClassOf(fi.childId) === classFilter.value))
+const sanitationPlans = computed(() =>
+  data.state.sanitationPlans.filter(sp => !classFilter.value || sp.classId === classFilter.value))
+function childClassOf(childId: string) {
+  return data.childById(childId)?.classId || ''
+}
+function classmateObs(isoId: string) {
+  return data.state.classmateObservations.filter(co => co.isolationId === isoId)
+}
 const meds = (id: string) => data.state.medPlans.filter(m => m.childId === id)
 const medReg = (id: string) => data.parseMedicine(hc.value[id]?.medicine)
 const obs = (id: string) => data.state.observations.filter(o => o.childId === id)
@@ -222,6 +280,10 @@ function print() { window.print() }
 .temp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
 .temp-card { display: flex; gap: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: #fafbfe; }
 .id-img { width: 110px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); flex-shrink: 0; }
+.iso-record { border: 1px solid var(--line); border-left: 4px solid var(--red); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+.co-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.co-chip { font-size: 12px; background: #eef1f7; border-radius: 999px; padding: 3px 10px; }
+.co-chip.ab { background: var(--red-bg); color: var(--red); font-weight: 700; }
 .review-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .review-line { padding: 4px 0; border-bottom: 1px dashed #f0f2f8; line-height: 1.6; }
 .review-line.red { color: var(--red); }

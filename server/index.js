@@ -71,6 +71,8 @@ class GateError extends Error {
   constructor(status, message) { super(message); this.status = status }
 }
 
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+
 function pushAlert({ type, title, message = '', severity = 'warn', forRoles = '*', childId = null, classId = null, dedupe = false }) {
   if (dedupe) {
     const exist = db.prepare(
@@ -114,6 +116,9 @@ function roleScope(user) {
   } else if (user.role === 'teacher') {
     if (user.classId) classIds.add(user.classId)
     db.prepare('SELECT id FROM children WHERE class_id=?').all(user.classId).forEach(c => childIds.add(c.id))
+  } else if (user.role === 'cleaner') {
+    // 保育员只需要班级与消毒安排，不接触幼儿健康/接送明细
+    db.prepare('SELECT id FROM classes').all().forEach(c => classIds.add(c.id))
   } else {
     allChildren = true
     db.prepare('SELECT id FROM children').all().forEach(c => childIds.add(c.id))
@@ -179,6 +184,8 @@ app.get('/api/state', (req, res) => {
 
   const scope = roleScope(req.user)
   const inScope = (childId) => scope.allChildren || scope.childIds.has(childId)
+  // 保育员仅需要班级与消毒安排，不接触幼儿健康/接送明细
+  const cleaner = scope.role === 'cleaner'
 
   let children = all('SELECT * FROM children').filter(c => inScope(c.id))
   let pickups = all('SELECT * FROM pickups WHERE date=? ORDER BY scheduled_time, created_at', date)
@@ -216,21 +223,21 @@ app.get('/api/state', (req, res) => {
     // 用户目录仅保留展示所需，不含手机号等
     users: all(`SELECT id,username,name,role,class_id AS classId FROM users`),
     classes: all('SELECT * FROM classes ORDER BY sort'),
-    children,
-    parentLinks: scope.role === 'parent'
+    children: cleaner ? [] : children,
+    parentLinks: cleaner ? [] : (scope.role === 'parent'
       ? all('SELECT user_id AS userId, child_id AS childId FROM parent_links WHERE user_id=?', req.user.id)
-      : all('SELECT user_id AS userId, child_id AS childId FROM parent_links'),
-    authorizedPersons,
-    healthChecks: all('SELECT * FROM health_checks WHERE date=?', date).filter(h => inScope(h.childId)),
-    classDecisions: all('SELECT * FROM class_decisions WHERE date=?', date).filter(d => inScope(d.childId)),
-    medPlans: all('SELECT * FROM med_plans WHERE date=? ORDER BY planned_time', date).filter(m => inScope(m.childId)),
-    observations: all('SELECT * FROM observations WHERE date=? ORDER BY created_at', date).filter(o => inScope(o.childId)),
-    careTransfers: all('SELECT * FROM care_transfers WHERE date=? ORDER BY start_time', date).filter(t => inScope(t.childId)),
-    pickups,
-    gateLogs: all('SELECT * FROM gate_logs WHERE date(created_at)=? ORDER BY created_at DESC LIMIT 50', date)
+      : all('SELECT user_id AS userId, child_id AS childId FROM parent_links')),
+    authorizedPersons: cleaner ? [] : authorizedPersons,
+    healthChecks: cleaner ? [] : all('SELECT * FROM health_checks WHERE date=?', date).filter(h => inScope(h.childId)),
+    classDecisions: cleaner ? [] : all('SELECT * FROM class_decisions WHERE date=?', date).filter(d => inScope(d.childId)),
+    medPlans: cleaner ? [] : all('SELECT * FROM med_plans WHERE date=? ORDER BY planned_time', date).filter(m => inScope(m.childId)),
+    observations: cleaner ? [] : all('SELECT * FROM observations WHERE date=? ORDER BY created_at', date).filter(o => inScope(o.childId)),
+    careTransfers: cleaner ? [] : all('SELECT * FROM care_transfers WHERE date=? ORDER BY start_time', date).filter(t => inScope(t.childId)),
+    pickups: cleaner ? [] : pickups,
+    gateLogs: cleaner ? [] : all('SELECT * FROM gate_logs WHERE date(created_at)=? ORDER BY created_at DESC LIMIT 50', date)
       .filter(g => scope.allChildren || (g.childId && inScope(g.childId))),
-    pickupChanges,
-    busRecords: all('SELECT * FROM bus_records WHERE date=?', date).filter(b => inScope(b.childId)),
+    pickupChanges: cleaner ? [] : pickupChanges,
+    busRecords: cleaner ? [] : all('SELECT * FROM bus_records WHERE date=?', date).filter(b => inScope(b.childId)),
     activities: scope.allChildren
       ? all('SELECT * FROM activities WHERE date=? ORDER BY start_time', date)
       : all('SELECT * FROM activities WHERE date=? ORDER BY start_time', date).filter(a => scope.classIds.has(a.classId)),
@@ -243,7 +250,36 @@ app.get('/api/state', (req, res) => {
     alerts: all("SELECT * FROM alerts WHERE status='open' OR date(created_at)=? ORDER BY created_at DESC LIMIT 100", date)
       .filter(a => scope.allChildren ||
         (a.childId ? inScope(a.childId) : a.classId ? scope.classIds.has(a.classId) : true)),
-    confirmations: all('SELECT * FROM daily_confirmations WHERE date=?', date).filter(c => inScope(c.childId))
+    confirmations: all('SELECT * FROM daily_confirmations WHERE date=?', date).filter(c => inScope(c.childId)),
+    feverIsolations: (scope.role === 'cleaner'
+      ? []
+      : all('SELECT * FROM fever_isolations ORDER BY date DESC, created_at DESC LIMIT 60')
+        .filter(fi => scope.allChildren || scope.childIds.has(fi.childId))
+    ).map(fi => ({
+      ...fi,
+      symptoms: (() => { try { return JSON.parse(fi.symptoms || '[]') } catch { return [] } })()
+    })),
+    classmateObservations: scope.role === 'cleaner'
+      ? []
+      : all('SELECT co.* FROM classmate_observations co ORDER BY co.date DESC, co.created_at DESC LIMIT 200')
+          .filter(co => scope.allChildren || scope.classIds.has(co.classId)),
+    sanitationPlans: all('SELECT * FROM sanitation_plans ORDER BY date DESC, created_at DESC LIMIT 60')
+      .filter(sp => scope.allChildren || scope.classIds.has(sp.classId)),
+    // 次日晨检提醒：昨日有发热隔离，或昨日同班观察被标记异常的幼儿
+    nextDayMorningFlags: (() => {
+      const yesterday = new Date(Date.now() - 86400_000).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
+      const isoKids = new Set(db.prepare('SELECT child_id c FROM fever_isolations WHERE date=?').all(yesterday).map(r => r.c))
+      const coKids = new Set(db.prepare('SELECT DISTINCT child_id c FROM classmate_observations WHERE date=? AND abnormal=1').all(yesterday).map(r => r.c))
+      const flags = {}
+      for (const cid of [...isoKids, ...coKids]) {
+        if (!inScope(cid)) continue
+        flags[cid] = {
+          isolatedYesterday: isoKids.has(cid),
+          abnormalContactYesterday: coKids.has(cid)
+        }
+      }
+      return flags
+    })()
   })
 })
 
@@ -391,6 +427,151 @@ app.post('/api/observations', (req, res) => {
   res.json({ ok: true })
 })
 
+// ================= 园内发热隔离 =================
+const symptomText = (arr) => ({ 咳嗽: '咳嗽', 皮疹: '皮疹', 咽痛: '咽痛', 呕吐: '呕吐', 精神差: '精神差', 腹泻: '腹泻' })
+
+// 登记午后发热隔离（保健老师）
+app.post('/api/fever-isolations', requireRole('health'), wrap((req, res) => {
+  const b = req.body || {}
+  const child = db.prepare('SELECT * FROM children WHERE id=?').get(b.childId)
+  if (!child) throw new GateError(404, '幼儿不存在')
+  if (!(Number(b.temperature) >= 37.3)) throw new GateError(400, '隔离登记体温需 ≥37.3℃')
+  if (!b.isolationRoom) throw new GateError(400, '请填写隔离室')
+  // 同班未解除的活动隔离不重复建档
+  const exist = one(`SELECT id FROM fever_isolations WHERE child_id=? AND date=? AND status!='released'`, b.childId, today())
+  if (exist) throw new GateError(409, '该幼儿今日已有进行中的隔离记录')
+
+  const id = uid('fi')
+  const symptoms = Array.isArray(b.symptoms) ? JSON.stringify(b.symptoms) : '[]'
+  db.prepare(`INSERT INTO fever_isolations
+    (id,child_id,date,temperature,symptoms,isolation_room,start_time,parent_notified_at,class_contact,status,by_user,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?, 'isolating', ?, ?)`)
+    .run(id, b.childId, today(), Number(b.temperature), symptoms, b.isolationRoom,
+      b.startTime || nowHHMM(), b.parentNotifiedAt || null, b.classContact || '',
+      req.user.name, nowStr())
+  const childInfo = toCamel(child)
+  pushAlert({
+    type: 'fever', childId: b.childId, classId: child.class_id, severity: 'critical',
+    forRoles: 'health,teacher,principal,parent',
+    title: `午后发热隔离：${child.name} ${b.temperature}℃`,
+    message: `已入${b.isolationRoom}，请班主任立即追踪同班儿童咳嗽/缺勤/家长反馈，保育员准备班级消毒`
+  })
+  pushAlert({
+    type: 'fever', childId: b.childId, classId: child.class_id, severity: 'warn',
+    forRoles: 'teacher',
+    title: `同班观察待办：${child.name} 发热隔离`,
+    message: '请记录同班每名儿童的咳嗽、缺勤与家长反馈，结果将影响次日晨检与消毒安排'
+  })
+  broadcast('isolation')
+  res.json({ ok: true, id })
+}))
+
+// 保健老师生成"带回就医建议"并通知家长
+app.post('/api/fever-isolations/:id/advice', requireRole('health'), wrap((req, res) => {
+  const fi = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.params.id)
+  if (!fi) throw new GateError(404, '隔离记录不存在')
+  if (!req.body.advice) throw new GateError(400, '请填写就医建议')
+  db.prepare(`UPDATE fever_isolations SET medical_advice=?, advice_at=?, advice_by=?,
+    parent_notified_at=COALESCE(parent_notified_at,?), status='advised' WHERE id=?`)
+    .run(req.body.advice, nowHHMM(), req.user.name, req.body.parentNotifiedAt || nowHHMM(), fi.id)
+  const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', fi.child_id)
+  pushAlert({
+    type: 'fever', childId: fi.child_id, classId: child?.classId, severity: 'critical',
+    forRoles: 'health,teacher,principal,parent',
+    title: `带回就医建议：${child?.name}`,
+    message: req.body.advice
+  })
+  db.prepare(`INSERT INTO communications (id,child_id,class_id,channel,from_user,from_name,to_role,content,acked,created_at)
+    VALUES (?,?,?, 'app', ?, ?, 'parent', ?, 0, ?)`)
+    .run(uid('cm'), fi.child_id, child?.classId, req.user.name, req.user.name,
+      `【发热隔离就医建议】${req.body.advice}（${req.user.name} ${nowHHMM()}）`, nowStr())
+  broadcast('isolation')
+  res.json({ ok: true })
+}))
+
+// 解除隔离
+app.post('/api/fever-isolations/:id/release', requireRole('health'), wrap((req, res) => {
+  db.prepare(`UPDATE fever_isolations SET released=1, released_at=?, status='released' WHERE id=?`)
+    .run(req.body.releasedAt || nowHHMM(), req.params.id)
+  broadcast('isolation')
+  res.json({ ok: true })
+}))
+
+// 同班儿童观察批量提交（班主任）：咳嗽/缺勤/家长反馈，异常者影响次日晨检
+app.post('/api/classmate-observations', requireRole('teacher', 'health'), wrap((req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : []
+  const iso = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.body.isolationId)
+  if (!iso) throw new GateError(404, '隔离记录不存在')
+  if (req.user.role === 'teacher' && childClass(iso.child_id) !== req.user.classId) {
+    throw new GateError(403, '只能观察本班幼儿')
+  }
+  let abnormalCount = 0
+  const ins = db.prepare(`INSERT INTO classmate_observations
+    (id,isolation_id,class_id,child_id,date,cough,absent,parent_feedback,temperature,abnormal,by_user,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(isolation_id,child_id) DO UPDATE SET
+      cough=excluded.cough, absent=excluded.absent, parent_feedback=excluded.parent_feedback,
+      temperature=excluded.temperature, abnormal=excluded.abnormal, by_user=excluded.by_user`)
+  const tx = db.transaction((rows) => {
+    for (const r of rows) {
+      const temp = r.temperature ? Number(r.temperature) : null
+      const abnormal = r.cough || r.absent || (temp && temp >= 37.3) ? 1 : 0
+      if (abnormal) abnormalCount++
+      ins.run(uid('co'), iso.id, iso.class_id ? iso.class_id : childClass(iso.child_id), r.childId,
+        today(), r.cough ? 1 : 0, r.absent ? 1 : 0, r.parentFeedback || '', temp,
+        abnormal, req.user.name, nowStr())
+    }
+  })
+  tx(items)
+  const child = one('SELECT name FROM children WHERE id=?', iso.child_id)
+  if (abnormalCount) {
+    pushAlert({
+      type: 'fever', childId: iso.child_id, classId: iso.class_id, severity: 'critical',
+      forRoles: 'health,teacher,principal',
+      title: `同班观察发现 ${abnormalCount} 名异常儿童：${child?.name} 发热关联`,
+      message: '已纳入次日晨检重点名单，并建议加强班级消毒'
+    })
+  }
+  broadcast('classmate-obs')
+  res.json({ ok: true, abnormalCount })
+}))
+
+// 创建消毒安排并通知保育员（保健老师/园长）
+app.post('/api/sanitation-plans', requireRole('health', 'principal'), wrap((req, res) => {
+  const b = req.body || {}
+  if (!b.classId || !b.scope) throw new GateError(400, '请选择班级与消毒范围')
+  const id = uid('sp')
+  db.prepare(`INSERT INTO sanitation_plans
+    (id,class_id,date,scope,reason,isolation_id,due_time,status,notified_cleaner,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?)`)
+    .run(id, b.classId, today(), b.scope, b.reason || '发热/传染病预防性消毒', b.isolationId || null,
+      b.dueTime || '17:00', '吴阿姨（保育员）', req.user.name, nowStr())
+  const cls = one('SELECT name FROM classes WHERE id=?', b.classId)
+  pushAlert({
+    type: 'disease', classId: b.classId, severity: 'warn', forRoles: 'cleaner,health,principal,teacher',
+    title: `消毒安排：${cls?.name} ${b.dueTime || '17:00'} 前`,
+    message: `${b.scope}｜${b.reason || '预防性消毒'}，已通知保育员，完成后进入班级记录`
+  })
+  broadcast('sanitation')
+  res.json({ ok: true, id })
+}))
+
+// 保育员完成消毒 → 进入班级记录
+app.post('/api/sanitation-plans/:id/done', requireRole('cleaner'), wrap((req, res) => {
+  const sp = db.prepare('SELECT * FROM sanitation_plans WHERE id=?').get(req.params.id)
+  if (!sp) throw new GateError(404, '消毒安排不存在')
+  db.prepare(`UPDATE sanitation_plans SET status='done', done_at=?, done_by=? WHERE id=?`)
+    .run(nowHHMM(), req.user.name, req.params.id)
+  const cls = one('SELECT name FROM classes WHERE id=?', sp.class_id)
+  pushAlert({
+    type: 'disease', classId: sp.class_id, severity: 'info', forRoles: 'health,teacher,principal,cleaner',
+    title: `消毒完成：${cls?.name}`,
+    message: `${req.user.name} ${nowHHMM()} 完成（${sp.scope}），已进入班级记录`
+  })
+  broadcast('sanitation')
+  res.json({ ok: true })
+}))
+
 // 临时托管到其他班级
 app.post('/api/care-transfers', (req, res) => {
   const b = req.body
@@ -426,8 +607,6 @@ function findPlannedPickup(childId) {
   return db.prepare(`SELECT * FROM pickups WHERE child_id=? AND date=? AND status='planned'
     ORDER BY scheduled_time DESC LIMIT 1`).get(childId, today())
 }
-
-const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 
 function nowStamp() {
   const d = new Date()

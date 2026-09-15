@@ -298,6 +298,63 @@ CREATE TABLE IF NOT EXISTS gate_offline_permits (
   date TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- 园内发热隔离记录
+CREATE TABLE IF NOT EXISTS fever_isolations (
+  id TEXT PRIMARY KEY,
+  client_id TEXT UNIQUE,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  temperature REAL,
+  symptoms TEXT,               -- JSON 数组：咳嗽/皮疹/咽痛/呕吐/精神差...
+  isolation_room TEXT,         -- 隔离室
+  start_time TEXT NOT NULL,
+  parent_notified_at TEXT,     -- 通知家长时间
+  class_contact TEXT,          -- 同班接触情况
+  medical_advice TEXT,         -- 带回就医建议
+  advice_at TEXT,
+  advice_by TEXT,
+  released INTEGER DEFAULT 0,
+  released_at TEXT,
+  status TEXT DEFAULT 'isolating', -- isolating | advised | released
+  by_user TEXT,
+  created_at TEXT
+);
+
+-- 同班儿童观察（隔离期间对同班其他幼儿的咳嗽/缺勤/家长反馈追踪）
+CREATE TABLE IF NOT EXISTS classmate_observations (
+  id TEXT PRIMARY KEY,
+  client_id TEXT UNIQUE,
+  isolation_id TEXT NOT NULL,
+  class_id TEXT NOT NULL,
+  child_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  cough INTEGER DEFAULT 0,
+  absent INTEGER DEFAULT 0,
+  parent_feedback TEXT,
+  temperature REAL,
+  abnormal INTEGER DEFAULT 0,  -- 是否判定异常（影响次日晨检提醒）
+  by_user TEXT,
+  created_at TEXT,
+  UNIQUE(isolation_id, child_id)
+);
+
+-- 班级消毒安排（通知保育员，完成后进入班级记录）
+CREATE TABLE IF NOT EXISTS sanitation_plans (
+  id TEXT PRIMARY KEY,
+  class_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  scope TEXT,                  -- 教室/午睡室/玩具/餐具...
+  reason TEXT,                 -- 关联发热/传染病
+  isolation_id TEXT,
+  due_time TEXT,
+  status TEXT DEFAULT 'pending', -- pending | done
+  notified_cleaner TEXT,
+  done_at TEXT,
+  done_by TEXT,
+  created_by TEXT,
+  created_at TEXT
+);
 `)
 
 // 旧版本库结构的幂等列迁移（CREATE TABLE IF NOT EXISTS 不会补列）

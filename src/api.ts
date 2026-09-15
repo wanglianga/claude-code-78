@@ -67,6 +67,14 @@ export const api = {
   confirmDaily: (childId: string, byUser: string) =>
     request(`/api/daily/${childId}/confirm`, { method: 'POST', body: JSON.stringify({ byUser }) }),
 
+  // 发热隔离 / 同班观察 / 消毒
+  createIsolation: (b: any) => request('/api/fever-isolations', { method: 'POST', body: JSON.stringify(b) }),
+  isolationAdvice: (id: string, b: any) => request(`/api/fever-isolations/${id}/advice`, { method: 'POST', body: JSON.stringify(b) }),
+  isolationRelease: (id: string, b?: any) => request(`/api/fever-isolations/${id}/release`, { method: 'POST', body: JSON.stringify(b || {}) }),
+  classmateObservations: (b: any) => request('/api/classmate-observations', { method: 'POST', body: JSON.stringify(b) }),
+  sanitationPlan: (b: any) => request('/api/sanitation-plans', { method: 'POST', body: JSON.stringify(b) }),
+  sanitationDone: (id: string) => request(`/api/sanitation-plans/${id}/done`, { method: 'POST' }),
+
   // permitToken 为门卫断网前领取的当日离线许可，服务端据此鉴权补传
   sync: (events: any[], permitToken?: string | null) =>
     request('/api/sync', { method: 'POST', body: JSON.stringify({ events, permitToken }) })

@@ -58,7 +58,8 @@ const accounts = [
   { u: 'guard', label: '陈门卫 · 门卫大屏', icon: '🛡️' },
   { u: 'principal', label: '刘园长', icon: '👔' },
   { u: 'parent1', label: '李妈妈 · 家长端', icon: '👩' },
-  { u: 'parent2', label: '张爸爸 · 家长端', icon: '👨' }
+  { u: 'parent2', label: '张爸爸 · 家长端', icon: '👨' },
+  { u: 'cleaner', label: '吴阿姨 · 保育员', icon: '🧹' }
 ]
 function pick(a: { u: string }) { username.value = a.u; password.value = '123456'; err.value = '' }
 

@@ -8,7 +8,8 @@ const empty: AppState = {
   users: [], classes: [], children: [], parentLinks: [], authorizedPersons: [],
   healthChecks: [], classDecisions: [], medPlans: [], observations: [], careTransfers: [],
   pickups: [], gateLogs: [], pickupChanges: [], busRecords: [], activities: [],
-  diseaseAlerts: [], teacherHandovers: [], communications: [], alerts: [], confirmations: []
+  diseaseAlerts: [], teacherHandovers: [], communications: [], alerts: [], confirmations: [],
+  feverIsolations: [], classmateObservations: [], sanitationPlans: [], nextDayMorningFlags: {}
 }
 
 let debounceTimer: number | undefined

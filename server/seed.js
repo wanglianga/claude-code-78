@@ -26,7 +26,8 @@ export function seed() {
     ['u_parent1', 'parent1', '李妈妈', 'parent', '13900000001', null],
     ['u_parent2', 'parent2', '张爸爸', 'parent', '13900000002', null],
     ['u_parent3', 'parent3', '陈妈妈', 'parent', '13900000003', null],
-    ['u_parent4', 'parent4', '周妈妈', 'parent', '13900000004', null]
+    ['u_parent4', 'parent4', '周妈妈', 'parent', '13900000004', null],
+    ['u_cleaner', 'cleaner', '吴阿姨', 'cleaner', '13800000006', null]
   ]
   const insUser = db.prepare('INSERT INTO users (id,username,password,name,role,phone,class_id) VALUES (?,?,?,?,?,?,?)')
   users.forEach(u => insUser.run(u[0], u[1], '123456', u[2], u[3], u[4], u[5]))
@@ -153,4 +154,25 @@ export function seed() {
     VALUES (?,?,?, 'app', ?, ?, ?, ?, 0, ?)`)
     .run(uid('cm'), 'c_lele', 'cls_sunflower', '林保健', '林保健', 'parent',
       '乐乐妈妈您好，乐乐晨检体温 37.9℃ 伴轻咳，建议接回休息，退热 48 小时后返园。', t)
+
+  // ---- 昨日发热隔离（用于演示次日晨检提醒与未完成消毒）----
+  const yesterday = new Date(Date.now() - 86400_000).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
+  db.prepare(`INSERT INTO fever_isolations
+    (id,child_id,date,temperature,symptoms,isolation_room,start_time,parent_notified_at,class_contact,medical_advice,advice_at,advice_by,released,released_at,status,by_user,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?, 'released', ?, ?)`)
+    .run(uid('fi'), 'c_kangkang', yesterday, 38.4,
+      JSON.stringify(['咳嗽', '咽痛']), '保健观察室', '13:10', '13:15',
+      '午餐与午睡与同班 12 名幼儿有密切接触，午睡邻床为陈安安',
+      '建议立即带回就医，进行退热与呼吸道检查，凭返园证明复园', '13:25', '林保健', '16:40', '林保健', t)
+  const fiId = db.prepare('SELECT id FROM fever_isolations WHERE child_id=? AND date=?').get('c_kangkang', yesterday).id
+  db.prepare(`INSERT INTO classmate_observations
+    (id,isolation_id,class_id,child_id,date,cough,absent,parent_feedback,temperature,abnormal,by_user,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(uid('co'), fiId, 'cls_littlebee', 'c_an_an', yesterday, 1, 0, '家长反馈夜间偶咳，无发热', 36.8, 1, '赵老师', t)
+  // 该班今日仍有一项待完成消毒（通知保育员）
+  db.prepare(`INSERT INTO sanitation_plans
+    (id,class_id,date,scope,reason,isolation_id,due_time,status,notified_cleaner,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?)`)
+    .run(uid('sp'), 'cls_littlebee', date, '午睡室、口杯毛巾、玩教具表面',
+      '昨日周康康发热隔离，同班观察发现陈安安咳嗽', fiId, '09:30', '吴阿姨', '林保健', t)
 }
