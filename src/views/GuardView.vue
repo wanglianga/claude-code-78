@@ -56,21 +56,25 @@
                 <p v-if="verifyErr" class="verify-err">❌ {{ verifyErr }}</p>
               </template>
 
-              <!-- 离线登记 -->
+              <!-- 离线登记：只能从本机最后同步的当日授权名单中选择，并必须拍照 -->
               <template v-if="!effectiveOnline && pickup.status !== 'picked'">
                 <div class="offline-note">
-                  离线期间无法在线核验授权码，请登记接送人信息并拍照，回园系统补传后追溯。
+                  离线期间无法在线核验授权码：请核对来人证件，从<b>本机当日授权名单</b>中选择接送人并拍照，
+                  联网补传时服务端会再次按当日有效授权复核（临时改接导致的旧授权将被拒绝）。
                 </div>
                 <div class="row">
-                  <label class="field grow"><span>接送人姓名</span><input v-model="off.personName" /></label>
-                  <label class="field grow"><span>与幼儿关系</span>
-                    <select v-model="off.relation">
-                      <option value="parent">家长</option><option value="grandparent">祖辈</option>
-                      <option value="nanny">保姆</option><option value="temporary">临时授权人</option>
+                  <label class="field grow"><span>当日授权接送人（本机名单）</span>
+                    <select v-model="off.personId">
+                      <option value="" disabled>请选择</option>
+                      <option v-for="p in offlinePersons" :key="p.id" :value="p.id">
+                        {{ p.name }}（{{ relationLabel[p.relation] }} · 证件尾号 {{ p.idLast4 || '—' }}）
+                      </option>
                     </select>
                   </label>
-                  <label class="field grow"><span>证件后四位</span><input v-model="off.idLast4" maxlength="4" /></label>
                 </div>
+                <p v-if="!offline.hasValidPermit" class="verify-err">
+                  ⚠ 本机尚无当日离线许可，补传时可能被服务端拒绝；恢复网络后将自动获取。
+                </p>
                 <PhotoCapture v-model="off.photoUrl" />
                 <div class="row" style="gap:10px; margin-top:10px">
                   <button class="btn btn-primary big-btn" @click="offlineCheckout">📝 离线登记放行</button>
@@ -175,7 +179,7 @@
         <div class="row">
           <label class="field grow"><span>来人姓名</span><input v-model="denyForm.personName" /></label>
           <label class="field grow"><span>声称接的幼儿</span>
-            <input v-model="denyForm.childName" placeholder="幼儿姓名" />
+            <input :value="child?.name || '—'" disabled />
           </label>
         </div>
         <label class="field"><span>拦截原因</span>
@@ -203,34 +207,38 @@ import { useUiStore } from '../store/ui'
 import { api } from '../api'
 import PhotoCapture from '../components/PhotoCapture.vue'
 import { relationLabel, timeShort } from '../helpers'
-import type { Child, AuthorizedPerson, Pickup } from '../types'
+import type { Child, Pickup } from '../types'
 
 const data = useDataStore()
 const offline = useOfflineStore()
 const ui = useUiStore()
 
 const effectiveOnline = computed(() => data.online && !data.simOffline)
-function toggleSimOffline() {
+async function toggleSimOffline() {
   data.simOffline = !data.simOffline
   ;(window as any).__kg_sim_offline = data.simOffline
   if (!data.simOffline) {
     // 恢复网络：立即刷新大屏 + 补传本机记录
     data.fetchState()
+    await offline.ensurePermit()
     offline.flush()
     ui.show('网络已恢复，开始补同步')
   } else {
-    ui.show('已模拟断网：可离线登记接送', 'err')
+    // 断网前确保已领取当日离线许可（联网状态下）
+    await offline.ensurePermit()
+    ui.show(offline.hasValidPermit ? '已模拟断网：可离线登记接送' : '已模拟断网：未取得离线许可，补传将被拒绝', 'err')
   }
 }
 const keyword = ref('')
 const child = ref<Child | null>(null)
 const pin = ref('')
 const verifyErr = ref('')
-const verified = ref<{ person: AuthorizedPerson } | null>(null)
+// 服务端签发的一次性放行结果（令牌 + 服务端返回的接送人信息）
+const verified = ref<{ token: string; person: { id: string; name: string; relation: string; phone?: string } } | null>(null)
 const photoUrl = ref('')
 const denyOpen = ref(false)
-const off = ref({ personName: '', relation: 'temporary', idLast4: '', photoUrl: '' })
-const denyForm = ref({ personName: '', childName: '', reason: '不在今日授权名单' })
+const off = ref({ personId: '', photoUrl: '' })
+const denyForm = ref({ personName: '', reason: '不在今日授权名单' })
 
 const filteredChildren = computed(() => {
   const k = keyword.value.trim()
@@ -245,6 +253,9 @@ function relClass(r?: string) {
 }
 const pickup = computed<Pickup | undefined>(() =>
   child.value ? data.effectivePickupByChild[child.value.id] : undefined)
+// 本机最后一次同步到的当日授权名单（离线可选范围）
+const offlinePersons = computed(() =>
+  child.value ? data.state.authorizedPersons.filter(p => p.childId === child.value!.id) : [])
 function needsHome(childId: string) {
   const hc = data.healthByChild[childId]
   const dec = data.decisionByChild[childId]
@@ -273,7 +284,7 @@ function pickChild(c: Child) {
   child.value = c
   pin.value = ''; verifyErr.value = ''; verified.value = null; photoUrl.value = ''
   const p = data.effectivePickupByChild[c.id]
-  off.value = { personName: p?.personName || '', relation: (p?.relation as any) || 'parent', idLast4: '', photoUrl: '' }
+  off.value = { personId: p?.personId || '', photoUrl: '' }
 }
 
 async function doVerify() {
@@ -281,9 +292,9 @@ async function doVerify() {
   if (!pickup.value?.personId) { verifyErr.value = '今日无有效授权，请勿放行'; return }
   if (!/^\d{4}$/.test(pin.value)) { verifyErr.value = '请输入 4 位授权码'; return }
   try {
+    // 服务端校验当日有效授权匹配与授权码，签发一次性放行令牌
     const r = await api.verify(pickup.value.personId, pin.value)
-    if (!r.ok) { verifyErr.value = r.error || '核验失败'; return }
-    verified.value = { person: r.person }
+    verified.value = { token: r.token, person: r.person }
     ui.show('身份核验通过，请拍照放行')
   } catch (e: any) {
     verifyErr.value = e.message
@@ -291,44 +302,48 @@ async function doVerify() {
 }
 
 async function onlineCheckout() {
-  if (!verified.value || !child.value || !pickup.value) return
-  await api.checkout({
-    childId: child.value.id, childName: child.value.name,
-    personId: pickup.value.personId, personName: verified.value.person.name,
-    relation: verified.value.person.relation,
-    pinVerified: true, photoUrl: photoUrl.value, actualTime: undefined
-  })
-  ui.show('已放行，离园记录同步各方')
-  verified.value = null; photoUrl.value = ''; pin.value = ''
+  if (!verified.value) return
+  if (!photoUrl.value) { ui.show('请先拍摄接送照片', 'err'); return }
+  try {
+    // 只提交服务端签发的核验令牌与照片；姓名/关系/pinVerified 均不由客户端提供
+    await api.checkout(verified.value.token, photoUrl.value)
+    ui.show('已放行，离园记录同步各方')
+    verified.value = null; photoUrl.value = ''; pin.value = ''
+  } catch (e: any) {
+    ui.show(e.message, 'err')
+  }
 }
 
 function offlineCheckout() {
   if (!child.value) return
-  if (!off.value.personName) { ui.show('请登记接送人姓名', 'err'); return }
+  if (!off.value.personId) { ui.show('请从当日授权名单选择接送人', 'err'); return }
+  if (!off.value.photoUrl) { ui.show('离线登记同样必须拍照', 'err'); return }
+  const person = offlinePersons.value.find(p => p.id === off.value.personId)
   offline.enqueue('checkout', {
     childId: child.value.id, childName: child.value.name,
-    personName: off.value.personName, relation: off.value.relation,
-    idLast4: off.value.idLast4, photoUrl: off.value.photoUrl,
-    pinVerified: false
+    // personId 是补传时服务端复核的唯一身份依据；其余仅用于本机显示
+    personId: off.value.personId,
+    personName: person?.name || '', relation: person?.relation,
+    photoUrl: off.value.photoUrl
   })
-  ui.show('已离线记录，联网后自动补同步')
-  off.value = { personName: '', relation: 'temporary', idLast4: '', photoUrl: '' }
+  ui.show('已离线记录，联网后凭当日离线许可补同步')
+  off.value = { personId: '', photoUrl: '' }
 }
 
 function openDeny() {
-  denyForm.value = { personName: '', childName: child.value?.name || '', reason: '不在今日授权名单' }
+  denyForm.value = { personName: '', reason: '不在今日授权名单' }
   denyOpen.value = true
 }
 async function doDeny() {
   const payload = {
-    childId: child.value?.id || null, childName: denyForm.value.childName,
+    childId: child.value?.id || null,
     personName: denyForm.value.personName, reason: denyForm.value.reason
   }
   if (effectiveOnline.value) {
     await api.gateDeny(payload)
     ui.show('已拦截并报警班主任/园长')
   } else {
-    offline.enqueue('gate_deny', payload)
+    offline.enqueue('gate_deny', { ...payload, childName: child.value?.name || '' })
     ui.show('拦截已离线记录，恢复后补传报警')
   }
   denyOpen.value = false

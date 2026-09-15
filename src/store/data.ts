@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { api } from '../api'
+import { useAuthStore } from './auth'
 import type { AppState, Alert, Role, Pickup, Child } from '../types'
 
 const empty: AppState = {
@@ -22,7 +23,8 @@ export const useDataStore = defineStore('data', {
     syncing: false,
     localClock: '',
     lastKind: '',
-    simOffline: false
+    simOffline: false,
+    sseStarted: false
   }),
   getters: {
     childrenByClass: (s) => {
@@ -83,20 +85,40 @@ export const useDataStore = defineStore('data', {
       window.clearTimeout(debounceTimer)
       debounceTimer = window.setTimeout(() => this.fetchState(), 250)
     },
+    // 登录成功后立即调用：先拉同一份快照，再建立 SSE
+    async init() {
+      await this.fetchState()
+      this.connectSSE()
+    },
     connectSSE() {
+      if (this.sseStarted) return
+      this.sseStarted = true
       this.tickClock()
-      setInterval(() => this.tickClock(), 30_000)
+      const timer = setInterval(() => this.tickClock(), 30_000)
 
-      const es = new EventSource('/events')
-      es.addEventListener('hello', () => { this.sseConnected = true })
-      es.addEventListener('sync', (ev: MessageEvent) => {
-        try {
-          const data = JSON.parse(ev.data)
-          this.sseConnected = true
-          this.scheduleFetch(data.kind)
-        } catch { /* noop */ }
-      })
-      es.onerror = () => { this.sseConnected = false }
+      const auth = useAuthStore()
+      const open = () => {
+        // EventSource 不能自定义请求头，会话 token 走 query
+        const es = new EventSource(`/events?token=${encodeURIComponent(auth.token || '')}`)
+        es.addEventListener('hello', () => { this.sseConnected = true })
+        es.addEventListener('sync', (ev: MessageEvent) => {
+          try {
+            const data = JSON.parse(ev.data)
+            this.sseConnected = true
+            this.scheduleFetch(data.kind)
+          } catch { /* noop */ }
+        })
+        es.onerror = () => {
+          this.sseConnected = false
+          // 浏览器会自动重连；401 时关闭，避免无限重试
+          if (es.readyState === EventSource.CLOSED) {
+            this.sseStarted = false
+            clearInterval(timer)
+          }
+        }
+        return es
+      }
+      open()
 
       window.addEventListener('online', () => {
         this.online = true

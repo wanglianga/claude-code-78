@@ -17,8 +17,8 @@ const router = createRouter({
   routes: [
     { path: '/login', component: Login },
     { path: '/', redirect: () => {
-      const u = JSON.parse(localStorage.getItem('kg_user') || 'null')
-      return u ? `/${u.role}` : '/login'
+      const s = JSON.parse(localStorage.getItem('kg_auth') || 'null')
+      return s?.user ? `/${s.user.role}` : '/login'
     }},
     { path: '/health', component: HealthView, meta: { roles: ['health'] } },
     { path: '/teacher', component: TeacherView, meta: { roles: ['teacher'] } },

@@ -11,8 +11,10 @@
 - **前端**：Vue 3 + TypeScript + Pinia + Vue Router + Vite，纯 SPA，无需构建期外部依赖。
 - **后端**：Node.js + Express，单进程同时提供 REST API、SSE 实时事件与静态资源。
 - **数据库**：SQLite（better-sqlite3，WAL 模式），数据落盘到 Docker 卷 `/data`，重启不丢；**无额外数据库/缓存容器**，一条 compose 即可起。
-- **实时一致**：服务端 SSE 事件总线（`/events`），任何写操作广播一条 `sync` 事件，所有在线端（老师手持、门卫大屏、家长端）收到后拉取**同一份快照**（`/api/state`），从机制上保证"某一端停留在旧授权"不会发生；SSE 断开时前端自动降级为 10 秒轮询。
-- **门卫离线**：前端 IndexedStorage 方案落地为 localStorage outbox（`kg_offline_outbox_v1`）。断网期间接送放行/拦截事件带 `clientId` 入本机队列；恢复后 `POST /api/sync` 幂等回放（按 `client_id` 去重 + 事务批量写入），并以**设备登记时刻**而非补传时刻记录离园时间与晚接判定。
+- **实时一致**：服务端 SSE 事件总线（`/events?token=…`），任何写操作广播一条 `sync` 事件，所有在线端（老师手持、门卫大屏、家长端）收到后拉取**同一份快照**（`/api/state`），从机制上保证"某一端停留在旧授权"不会发生；SSE 断开时前端自动降级为 10 秒轮询。
+- **登录即就绪**：登录成功服务端签发会话 token（`sessions` 表），前端立即用该 token 拉取快照并建立 SSE——家长、门卫、老师从登录页进入后**无需刷新**即看到业务内容；所有 `/api/*`（除健康检查/登录）与 SSE 都强制鉴权，401 自动回登录页。
+- **接送放行服务端门禁**：不信任任何客户端身份字段。门卫在线核验授权码 → 服务端校验"当日有效授权人 ∧ 当前有效接送计划匹配 ∧ 授权码正确"后签发**一次性放行令牌**（`pickup_verifications`，放行成功即作废）；放行接口只接受令牌 + 接送照片，姓名/关系/`pinVerified` 全部由服务端从数据库反查落库。无会话、非门卫角色、未核验、令牌失效/重用、授权人与计划不匹配（旧授权）、缺照片，一律 4xx 且**接送计划与门卫流水均不变**。
+- **门卫离线**：门卫联网时先领取**当日离线许可**（`gate_offline_permits`，仅门卫会话可领）；断网期间只能从本机最后同步的**当日授权名单**中选人并拍照，事件带 `clientId` 存 localStorage outbox。恢复后 `POST /api/sync`（门卫会话 + 离线许可）先对整批做只读门禁预校验（授权匹配 + 照片），任一不通过整体 4xx 不写库；全部通过才事务落库，按 `clientId` 幂等，并以**设备登记时刻**（非补传时刻）记录离园时间与晚接判定。
 
 ```
 浏览器（手持/大屏/家长端）
@@ -77,21 +79,29 @@ docker compose down -v       # 同时清空数据，下次启动重新写入干�
 
 ## 六、门卫离线 → 补同步专项验证（核心需求）
 
-门卫页面右上角点击 **"📶 模拟断网"**（也可直接拔网，浏览器会自动识别 `offline` 事件）：
+门卫页面右上角点击 **"📶 模拟断网"**（点击时会先用门卫会话领取当日离线许可；也可直接拔网，浏览器会自动识别 `offline` 事件）：
 
-1. 断网期间选择幼儿 → 登记接送人姓名/关系/证件后四位 → 拍照 → "离线登记放行"；也可登记"拒绝放行"。
+1. 断网期间选择幼儿 → 从**本机当日授权名单**中选择来人（不能手填姓名）→ 核对证件 → 拍照 → "离线登记放行"；也可登记"拒绝放行"。
 2. 页面顶部出现红色离线横幅，左侧"本机接送记录"出现**待补传**条目（计数徽章实时显示）。
-3. 点击"演示断网中（点击恢复）"或网络恢复：前端自动 `POST /api/sync`，条目变为"已补同步"，大屏出现"离线补传"角标。
-4. 后端对同一事件**重复补传幂等**（`client_id` 唯一约束 + 门卫流水双保险），并按设备登记时刻记录，不会因补传时刻错判晚接。
+3. 点击"演示断网中（点击恢复）"或网络恢复：前端自动携带离线许可调用 `POST /api/sync`，服务端对整批重新做授权匹配+照片门禁，条目变为"已补同步"，大屏出现"离线补传"角标。
+4. 服务端对同一事件**重复补传幂等**（`client_id` 唯一约束 + 门卫流水双保险），按设备登记时刻记录，不会因补传时刻错判晚接；若断网期间发生过临时改接导致旧授权失效，该条补传会被 403 拒绝并保留在队列中，提示到园人工复核，**绝不用旧授权放行**。
 
-接口层已验证的例子（登记时刻 18:05，晚于 17:30）：
+接口层已验证的例子（门卫会话 + 当日离线许可，登记时刻 18:05 晚于 17:30）：
 
 ```bash
-curl -X POST http://<host>/api/sync -H 'Content-Type: application/json' -d '{
+# 1) 门卫登录取会话 token
+GUARD_TOKEN=$(curl -s -X POST http://<host>/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"guard","password":"123456"}' | jq -r .token)
+# 2) 联网时领取当日离线许可
+PERMIT=$(curl -s -X POST http://<host>/api/gate/offline-permit -H "Authorization: Bearer $GUARD_TOKEN" | jq -r .permitToken)
+# 3) 恢复网络后补传（permitToken + personId + 照片缺一不可）
+curl -X POST http://<host>/api/sync -H "Authorization: Bearer $GUARD_TOKEN" -H 'Content-Type: application/json' -d '{
+  "permitToken":"'$PERMIT'",
   "events":[{"clientId":"offA","type":"checkout",
     "createdAt":"2026-09-15T18:05:00+08:00",
-    "payload":{"childId":"c_kangkang","childName":"周康康","personName":"周奶奶","relation":"grandparent"}}]}'
-# → {"ok":true,...,"late":true}；再次发送同一 clientId → {"ok":true,"duplicated":true}
+    "payload":{"childId":"c_kangkang","personId":"ap_kangkang_mom","photoUrl":"data:image/jpeg;base64,..."}}]}'
+# → {"ok":true,...,"late":true}；再次发送同一 clientId → duplicated:true；
+#   无许可/无照片/旧授权 → 401/400/403，整批不写入。
 ```
 
 ## 七、角色协同矩阵（同一幼儿状态）

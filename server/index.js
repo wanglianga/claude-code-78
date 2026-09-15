@@ -1,4 +1,5 @@
 import express from 'express'
+import { randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { db, nowStr, todayStr, nowHHMM, uid } from './db.js'
@@ -35,6 +36,41 @@ const one = (sql, ...p) => {
 }
 const today = () => todayStr()
 
+// ---------- 会话鉴权（服务端签发 token，不信任客户端角色）----------
+function sessionUser(req) {
+  const h = req.headers.authorization || ''
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null
+  if (!token) return null
+  const row = db.prepare(
+    `SELECT u.id AS id, u.username, u.name, u.role, u.phone, u.class_id AS classId, s.token AS token
+     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
+  ).get(token)
+  return row ? toCamel(row) : null
+}
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next()
+  if (req.path === '/api/health' || req.path === '/api/auth/login') return next()
+  const u = sessionUser(req)
+  if (!u) return res.status(401).json({ error: '未登录或会话已失效，请重新登录' })
+  req.user = u
+  next()
+})
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: `该操作仅 ${roles.join('/')} 角色可执行` })
+    }
+    next()
+  }
+}
+
+// 门禁校验失败（携带 HTTP 状态码），调用方必须保证抛出前无任何写库
+class GateError extends Error {
+  constructor(status, message) { super(message); this.status = status }
+}
+
 function pushAlert({ type, title, message = '', severity = 'warn', forRoles = '*', childId = null, classId = null, dedupe = false }) {
   if (dedupe) {
     const exist = db.prepare(
@@ -64,15 +100,31 @@ const ROLES_ALL = 'health,teacher,guard,principal,parent'
 app.get('/api/health', (_req, res) =>
   res.json({ ok: true, at: nowStr(), openAlerts: db.prepare("SELECT COUNT(*) AS c FROM alerts WHERE status='open'").get().c }))
 
-app.get('/events', sseHandler)
-
-// ---------- 认证（演示用，无 token）----------
+// ---------- 认证：服务端签发会话 token ----------
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body || {}
   const u = db.prepare('SELECT id,username,name,role,phone,class_id AS classId FROM users WHERE username=? AND password=?')
     .get(username, password)
   if (!u) return res.status(401).json({ error: '用户名或密码错误' })
-  res.json({ user: toCamel(u) })
+  const token = randomBytes(24).toString('hex')
+  db.prepare('INSERT INTO sessions (token,user_id,created_at) VALUES (?,?,?)').run(token, u.id, nowStr())
+  res.json({ user: toCamel(u), token })
+})
+
+app.post('/api/auth/logout', (req, res) => {
+  const h = req.headers.authorization || ''
+  if (h.startsWith('Bearer ')) {
+    db.prepare('DELETE FROM sessions WHERE token=?').run(h.slice(7))
+  }
+  res.json({ ok: true })
+})
+
+// SSE 同样需要会话（EventSource 无法自定义头，使用 query token）
+app.get('/events', (req, res) => {
+  const token = String(req.query.token || '')
+  const row = db.prepare('SELECT user_id FROM sessions WHERE token=?').get(token)
+  if (!row) { res.writeHead(401); return res.end('unauthorized') }
+  sseHandler(req, res)
 })
 
 // ---------- 全量快照（所有端拉同一份，配合 SSE 保证实时一致）----------
@@ -286,86 +338,156 @@ function findPlannedPickup(childId) {
     ORDER BY scheduled_time DESC LIMIT 1`).get(childId, today())
 }
 
-function doCheckout(p, via) {
-  // client_id 幂等
-  if (p.clientId) {
-    const dup = one('SELECT * FROM pickups WHERE client_id=?', p.clientId)
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+
+// 当日有效授权人（active 且临时授权未过期）
+function findActivePerson(personId, date = today()) {
+  if (!personId) return null
+  const person = one('SELECT * FROM authorized_persons WHERE id=? AND active=1', personId)
+  if (!person) return null
+  if (person.validUntil && person.validUntil < date) return null
+  return person
+}
+
+// 接送照片门禁：必须是真实的内嵌图片 dataURL 且有最小体积，防止空串/伪造占位
+function hasValidPhoto(photoUrl) {
+  return typeof photoUrl === 'string'
+    && /^data:image\/(jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]{500,}/i.test(photoUrl)
+}
+
+// ① 门卫在线核验授权码 → 签发一次性放行令牌（不返回可直接放行的布尔结果给业务端滥用）
+function issueVerification({ personId, pin, guardName }) {
+  const date = today()
+  const person = findActivePerson(personId, date)
+  if (!person) throw new GateError(404, '授权人不存在、已失效或临时授权已过期')
+  if (person.pin !== String(pin)) throw new GateError(403, '接送授权码错误，已拒绝')
+  const pickup = findPlannedPickup(person.childId)
+  if (!pickup) {
+    const picked = one("SELECT * FROM pickups WHERE child_id=? AND date=? AND status='picked'", person.childId, date)
+    throw new GateError(409, picked ? '该幼儿今日已离园，不能重复放行' : '该幼儿今日无有效接送计划，请联系班主任核实')
+  }
+  // 当日有效授权匹配：临时改接批准后旧授权人的 personId 与当前计划不一致 → 拒绝
+  if (pickup.person_id !== person.id) {
+    throw new GateError(403, '授权人与当前有效接送计划不匹配：该幼儿可能已临时改接，旧授权已作废')
+  }
+  const token = randomBytes(18).toString('hex')
+  db.prepare(`INSERT INTO pickup_verifications
+    (token,child_id,person_id,date,used,created_via,created_by,created_at)
+    VALUES (?,?,?,?,0,'online',?,?)`)
+    .run(token, person.childId, person.id, date, guardName, nowStr())
+  const child = one('SELECT * FROM children WHERE id=?', person.childId)
+  return {
+    token,
+    person: { id: person.id, name: person.name, relation: person.relation, phone: person.phone },
+    child: { id: child.id, name: child.name, classId: child.class_id }
+  }
+}
+
+// ② 凭核验结果落库放行。所有身份字段以服务端数据库为准，绝不采信客户端的 personName/pinVerified
+function finalizeCheckout(args) {
+  const { childId, personId, photoUrl, actualTime, via, clientId, gateClientId, logCreatedAt } = args
+  // 幂等优先（离线重放）：已存在则直接返回，不再做任何写入
+  if (clientId) {
+    const dup = one('SELECT * FROM pickups WHERE client_id=?', clientId)
     if (dup) return { ok: true, duplicated: true, row: dup }
   }
   const date = today()
-  const actual = p.actualTime || nowHHMM()
-  const late = actual > DEADLINE ? 1 : 0
-  const planned = findPlannedPickup(p.childId)
-  let id
-  if (planned) {
-    id = planned.id
-    db.prepare(`UPDATE pickups SET
-      person_id=COALESCE(?,person_id), person_name=?, relation=COALESCE(?,relation),
-      actual_time=?, photo_url=?, pin_verified=?, is_late=?, status='picked',
-      created_via=?, synced_at=?, client_id=COALESCE(?,client_id) WHERE id=?`)
-      .run(p.personId || null, p.personName, p.relation || null, actual,
-        p.photoUrl || null, p.pinVerified ? 1 : 0, late, via, nowStr(), p.clientId || null, id)
-  } else {
-    id = uid('pk')
-    db.prepare(`INSERT INTO pickups
-      (id,client_id,child_id,date,person_id,person_name,relation,method,scheduled_time,actual_time,photo_url,pin_verified,is_late,status,created_via,synced_at,created_at)
-      VALUES (?,?,?,?,?,?,?, 'walk', NULL,?,?,?,?, 'picked',?,?,?)`)
-      .run(id, p.clientId || null, p.childId, date, p.personId || null, p.personName,
-        p.relation || null, actual, p.photoUrl || null, p.pinVerified ? 1 : 0, late, via, nowStr(), nowStr())
+  const person = findActivePerson(personId, date)
+  if (!person) throw new GateError(404, '授权人不存在、已失效或临时授权已过期，禁止放行')
+  if (person.childId !== childId) throw new GateError(403, '授权人与被接送幼儿不匹配，禁止放行')
+  const planned = findPlannedPickup(childId)
+  if (!planned) {
+    const picked = one("SELECT * FROM pickups WHERE child_id=? AND date=? AND status='picked'", childId, date)
+    throw new GateError(409, picked ? '该幼儿今日已离园，不能重复放行' : '该幼儿今日无有效接送计划，禁止放行')
   }
+  if (planned.person_id !== person.id) {
+    throw new GateError(403, '授权人与当前有效接送计划不匹配（旧授权已作废），禁止放行')
+  }
+  if (!hasValidPhoto(photoUrl)) throw new GateError(400, '缺少有效的接送照片，必须拍照留影后方可放行')
+
+  const actual = actualTime || nowHHMM()
+  const late = actual > DEADLINE ? 1 : 0
+  db.prepare(`UPDATE pickups SET
+    person_id=?, person_name=?, relation=?,
+    actual_time=?, photo_url=?, pin_verified=1, is_late=?, status='picked',
+    created_via=?, synced_at=?, client_id=COALESCE(?,client_id) WHERE id=?`)
+    .run(person.id, person.name, person.relation, actual, photoUrl, late,
+      via, nowStr(), clientId || null, planned.id)
   db.prepare(`INSERT INTO gate_logs (id,client_id,child_id,child_name,person_name,result,reason,created_via,synced_at,created_at)
     VALUES (?,?,?,?,?, 'pass', ?, ?, ?, ?)`)
-    .run(uid('gl'), p.gateClientId || null, p.childId, p.childName || null, p.personName,
-      `${via === 'offline' ? '离线补传 · ' : ''}接送离园${late ? '（晚接）' : ''}`, via, nowStr(), p.logCreatedAt || nowStr())
-  const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', p.childId)
+    .run(uid('gl'), gateClientId || null, childId, args.childName || null, person.name,
+      `${via === 'offline' ? '离线补传 · ' : ''}接送离园${late ? '（晚接）' : ''}`, via, nowStr(), logCreatedAt || nowStr())
+  const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', childId)
   if (late) {
     pushAlert({
-      type: 'late', childId: p.childId, classId: child?.classId, severity: 'critical',
+      type: 'late', childId, classId: child?.classId, severity: 'critical',
       forRoles: 'guard,teacher,principal,parent',
       title: `晚接预警：${child?.name} ${actual} 离园`,
-      message: `超过规定离园时间 ${DEADLINE}，接送人 ${p.personName}，请班主任陪伴并通知家长`
+      message: `超过规定离园时间 ${DEADLINE}，接送人 ${person.name}，请班主任陪伴并通知家长`
     })
   }
-  return { ok: true, id, late: !!late }
+  return { ok: true, id: planned.id, late: !!late }
 }
 
-app.post('/api/pickups/verify', (req, res) => {
-  const { personId, pin } = req.body
-  const person = one('SELECT * FROM authorized_persons WHERE id=? AND active=1', personId)
-  if (!person) return res.status(404).json({ ok: false, error: '授权人不存在或已失效' })
-  if (person.validUntil && person.validUntil < today()) {
-    return res.status(403).json({ ok: false, error: '临时授权已过期' })
-  }
-  if (person.pin !== String(pin)) return res.json({ ok: false, error: '授权码错误' })
-  const child = one('SELECT * FROM children WHERE id=?', person.childId)
-  const pickup = findPlannedPickup(person.childId)
-  res.json({ ok: true, person, child, pickup })
-})
+app.post('/api/pickups/verify', requireRole('guard'), wrap((req, res) => {
+  const { personId, pin } = req.body || {}
+  if (!personId || !pin) throw new GateError(400, '缺少授权人或授权码')
+  res.json(issueVerification({ personId, pin: String(pin), guardName: req.user.name }))
+}))
 
-app.post('/api/pickups/checkout', (req, res) => {
-  const r = doCheckout(req.body, req.body.createdVia === 'offline' ? 'offline' : 'online')
+app.post('/api/pickups/checkout', requireRole('guard'), wrap((req, res) => {
+  const { verificationToken, photoUrl } = req.body || {}
+  if (!verificationToken) throw new GateError(401, '未检测到放行核验结果，请先核验接送授权码')
+  const v = db.prepare(`SELECT * FROM pickup_verifications
+    WHERE token=? AND date=? AND used=0 AND created_via='online'`).get(verificationToken, today())
+  if (!v) throw new GateError(401, '核验结果无效、已使用或已过期，请重新核验授权码')
+  // 令牌消费与放行落库在同一事务内：任何门禁失败都不会消耗令牌、不写接送计划、不写门卫流水
+  const r = db.transaction(() => {
+    const out = finalizeCheckout({
+      childId: v.child_id, personId: v.person_id,
+      photoUrl, via: 'online', childName: undefined
+    })
+    db.prepare('UPDATE pickup_verifications SET used=1 WHERE token=?').run(verificationToken)
+    return out
+  })()
   broadcast('pickup')
   res.json(r)
-})
+}))
 
-app.post('/api/gate/deny', (req, res) => {
-  const b = req.body
+// 门卫断网前领取当日离线许可（证明该设备联网时持有有效门卫会话）
+app.post('/api/gate/offline-permit', requireRole('guard'), wrap((req, res) => {
+  const date = today()
+  let row = one('SELECT * FROM gate_offline_permits WHERE user_id=? AND date=?', req.user.id, date)
+  if (!row) {
+    const token = randomBytes(20).toString('hex')
+    db.prepare('INSERT INTO gate_offline_permits (token,user_id,user_name,date,created_at) VALUES (?,?,?,?,?)')
+      .run(token, req.user.id, req.user.name, date, nowStr())
+    row = { token }
+  }
+  res.json({ permitToken: row.token, date })
+}))
+
+app.post('/api/gate/deny', requireRole('guard'), wrap((req, res) => {
+  const b = req.body || {}
   if (b.clientId && one('SELECT id FROM gate_logs WHERE client_id=?', b.clientId)) {
     return res.json({ ok: true, duplicated: true })
   }
+  // 幼儿姓名同样以库为准（客户端只能传 childId）
+  const child = b.childId ? one('SELECT name FROM children WHERE id=?', b.childId) : null
+  const childName = child?.name ?? (b.childName || null)
   db.prepare(`INSERT INTO gate_logs (id,client_id,child_id,child_name,person_name,result,reason,created_via,synced_at,created_at)
     VALUES (?,?,?,?,?, 'denied', ?, ?, ?, ?)`)
-    .run(uid('gl'), b.clientId || null, b.childId || null, b.childName || null, b.personName || '未知人员',
+    .run(uid('gl'), b.clientId || null, b.childId || null, childName, b.personName || '未知人员',
       b.reason || '未授权', b.createdVia === 'offline' ? 'offline' : 'online', nowStr(), nowStr())
   pushAlert({
     type: 'approval', childId: b.childId || null, classId: b.childId ? childClass(b.childId) : null,
     severity: 'critical', forRoles: 'guard,teacher,principal',
-    title: `门卫拦截：${b.childName ? b.childName + ' - ' : ''}${b.personName || '未知人员'}`,
+    title: `门卫拦截：${childName ? childName + ' - ' : ''}${b.personName || '未知人员'}`,
     message: b.reason || '未授权人员试图接走幼儿，已拒绝放行，请班主任/园长立即核实'
   })
   broadcast('deny')
   res.json({ ok: true })
-})
+}))
 
 // 临时改接 / 改时间申请
 app.post('/api/pickup-changes', (req, res) => {
@@ -534,8 +656,46 @@ app.post('/api/daily/:childId/confirm', (req, res) => {
 })
 
 // ---------- 门卫离线补同步：outbox 幂等回放 ----------
-app.post('/api/sync', (req, res) => {
+// 安全要求：补传时必须持有门卫会话 + 断网前领取的当日离线许可；
+// 放行事件以服务端当日有效授权与照片为准，任何一条不通过 → 整体 4xx，不写接送计划、不写门卫流水。
+app.post('/api/sync', requireRole('guard'), (req, res) => {
   const events = Array.isArray(req.body?.events) ? req.body.events : []
+  const permitToken = req.body?.permitToken
+  const date = today()
+  const permit = permitToken
+    ? one('SELECT * FROM gate_offline_permits WHERE token=? AND user_id=? AND date=?', permitToken, req.user.id, date)
+    : null
+  if (!permit) {
+    return res.status(401).json({ error: '缺少有效的当日离线许可（请在联网状态下以门卫账号重新获取），拒绝补传放行记录' })
+  }
+
+  const checkoutEvents = events.filter(e => e.type === 'checkout')
+  // ① 预校验阶段（只读）：幂等的跳过；任何非幂等放行不满足门禁立即 4xx
+  const planned = {}
+  for (const e of checkoutEvents) {
+    const p = { ...(e.payload || {}), clientId: e.clientId }
+    if (e.clientId && one('SELECT id FROM pickups WHERE client_id=?', e.clientId)) continue
+    if (e.clientId && one('SELECT id FROM gate_logs WHERE client_id=?', `${e.clientId}_gate`)) continue
+    if (!p.childId) return res.status(400).json({ error: '离线放行缺少幼儿标识，已拒绝整批补传' })
+    const person = findActivePerson(p.personId, date)
+    if (!person || person.childId !== p.childId) {
+      return res.status(403).json({ error: `离线放行核验失败：${p.childName || p.childId} 的授权人无效或不匹配（可能已临时改接），请到园人工复核，整批未写入` })
+    }
+    const plan = findPlannedPickup(p.childId)
+    if (!plan) {
+      const picked = one("SELECT id FROM pickups WHERE child_id=? AND date=? AND status='picked'", p.childId, date)
+      return res.status(409).json({ error: `${p.childName || p.childId} ${picked ? '已离园，不能重复放行' : '今日无有效接送计划'}，整批未写入` })
+    }
+    if (plan.person_id !== person.id) {
+      return res.status(403).json({ error: `离线授权人「${person.name}」与 ${p.childName || p.childId} 当前有效接送计划不匹配（旧授权已作废），整批未写入` })
+    }
+    if (!hasValidPhoto(p.photoUrl)) {
+      return res.status(400).json({ error: `离线放行缺少 ${p.childName || p.childId} 的有效接送照片，整批未写入` })
+    }
+    planned[e.clientId] = { plan, person }
+  }
+
+  // ② 写入阶段：全部通过门禁后事务落库
   const results = []
   const tx = db.transaction((evs) => {
     for (const e of evs) {
@@ -550,22 +710,26 @@ app.post('/api/sync', (req, res) => {
           }
         }
         if (e.type === 'checkout') {
-          p.gateClientId = e.clientId ? `${e.clientId}_gate` : null
-          // 幂等双保险：计划行可能带有更早的 client_id，再查门卫流水
-          if (p.gateClientId && one('SELECT id FROM gate_logs WHERE client_id=?', p.gateClientId)) {
+          if (e.clientId && one('SELECT id FROM pickups WHERE client_id=?', e.clientId)) {
             results.push({ clientId: e.clientId, ok: true, duplicated: true })
             continue
           }
-          results.push({ clientId: e.clientId, ...doCheckout(p, 'offline') })
+          const matched = planned[e.clientId]
+          results.push({ clientId: e.clientId, ...finalizeCheckout({
+            childId: p.childId, childName: p.childName, personId: matched.person.id,
+            photoUrl: p.photoUrl, actualTime: p.actualTime, via: 'offline',
+            clientId: e.clientId, gateClientId: `${e.clientId}_gate`, logCreatedAt: p.logCreatedAt
+          }) })
         } else if (e.type === 'gate_deny') {
           if (!e.clientId || !one('SELECT id FROM gate_logs WHERE client_id=?', e.clientId)) {
+            const child = p.childId ? one('SELECT name FROM children WHERE id=?', p.childId) : null
             db.prepare(`INSERT INTO gate_logs (id,client_id,child_id,child_name,person_name,result,reason,created_via,synced_at,created_at)
               VALUES (?,?,?,?,?, 'denied', ?, 'offline', ?, ?)`)
-              .run(uid('gl'), e.clientId || null, p.childId || null, p.childName || null,
+              .run(uid('gl'), e.clientId || null, p.childId || null, child?.name ?? p.childName ?? null,
                 p.personName || '未知人员', p.reason || '离线记录-未授权', nowStr(), e.createdAt || nowStr())
             pushAlert({
               type: 'approval', childId: p.childId || null, severity: 'critical', forRoles: 'guard,teacher,principal',
-              title: `门卫拦截（离线补传）：${p.childName ? p.childName + ' - ' : ''}${p.personName || '未知人员'}`,
+              title: `门卫拦截（离线补传）：${child?.name ? child.name + ' - ' : ''}${p.personName || '未知人员'}`,
               message: p.reason || '离线期间记录，已补同步'
             })
           }
@@ -575,7 +739,7 @@ app.post('/api/sync', (req, res) => {
             db.prepare(`INSERT INTO observations (id,client_id,child_id,date,type,content,severity,by_user,created_at)
               VALUES (?,?,?,?,?,?,?,?,?)`)
               .run(uid('ob'), e.clientId || null, p.childId, today(), p.type || 'other',
-                p.content || '', p.severity || 'info', p.byUser || '门卫(离线)', e.createdAt || nowStr())
+                p.content || '', p.severity || 'info', `${req.user.name}(离线)`, e.createdAt || nowStr())
           }
           results.push({ clientId: e.clientId, ok: true })
         } else if (e.type === 'transfer') {
@@ -583,14 +747,14 @@ app.post('/api/sync', (req, res) => {
             db.prepare(`INSERT INTO care_transfers (id,client_id,child_id,date,from_class_id,to_class_id,reason,start_time,status,by_user)
               VALUES (?,?,?,?,?,?,?,?,'active',?)`)
               .run(uid('ct'), e.clientId || null, p.childId, today(),
-                p.fromClassId || null, p.toClassId, p.reason || '离线登记', p.startTime || nowHHMM(), p.byUser || '门卫(离线)')
+                p.fromClassId || null, p.toClassId, p.reason || '离线登记', p.startTime || nowHHMM(), `${req.user.name}(离线)`)
           }
           results.push({ clientId: e.clientId, ok: true })
         } else {
           results.push({ clientId: e.clientId, ok: false, error: 'unknown-type' })
         }
       } catch (err) {
-        results.push({ clientId: e.clientId, ok: false, error: String(err.message || err) })
+        throw err
       }
     }
   })
@@ -609,8 +773,8 @@ app.use((req, res, next) => {
 })
 
 app.use((err, _req, res, _next) => {
-  console.error('[error]', err)
-  res.status(500).json({ error: err.message || '服务器内部错误' })
+  console.error('[error]', err.message)
+  res.status(err.status || 500).json({ error: err.message || '服务器内部错误' })
 })
 
 const PORT = process.env.PORT || 4000

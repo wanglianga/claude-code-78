@@ -50,8 +50,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, watch } from 'vue'
 import { useAuthStore } from './store/auth'
 import { useDataStore } from './store/data'
 import { useOfflineStore } from './store/offline'
@@ -62,7 +61,6 @@ const auth = useAuthStore()
 const data = useDataStore()
 const offline = useOfflineStore()
 const ui = useUiStore()
-const router = useRouter()
 
 const roleLabels: Record<string, string> = {
   health: '保健老师', teacher: '班主任', guard: '门卫', principal: '园长', parent: '家长'
@@ -87,23 +85,39 @@ async function resolve(a: any) {
   await api.resolveAlert(a.id)
   ui.show('预警已处理')
 }
-function logout() {
-  auth.logout()
-  router.push('/login')
+async function logout() {
+  await auth.logout()
+  // 硬跳转：关闭 SSE 连接并清空所有内存状态
+  window.location.href = '/login'
 }
 
-onMounted(async () => {
+// 登录成功（user 从无到有）或刷新页面（已有会话）都立即：拉同一快照 → 建立 SSE，无需手动刷新
+watch(() => auth.user, async (u, oldU) => {
+  if (!u || oldU) return
+  try {
+    // 登录成功后立即拉取同一状态快照并建立 SSE，页面无需刷新即显示业务内容
+    await data.init()
+    // 门卫联网时预先领取当日离线许可
+    if (u.role === 'guard') offline.ensurePermit()
+    if (navigator.onLine && u.role === 'guard') offline.flush()
+  } catch {
+    // 会话失效等错误由 kg-unauthorized 统一处理
+  }
+}, { immediate: true })
+
+// 保底：SSE 断连时轮询；恢复网络立即拉取并补同步
+setInterval(() => { if (auth.user && !data.sseConnected) data.fetchState() }, 10_000)
+setInterval(() => data.tickClock(), 10_000)
+window.addEventListener('kg-network-back', () => {
   if (!auth.user) return
-  await data.fetchState()
-  data.connectSSE()
-  // SSE 断连时的保底轮询；恢复网络后立即拉取并补同步
-  setInterval(() => { if (!data.sseConnected) data.fetchState() }, 10_000)
-  setInterval(() => data.tickClock(), 10_000)
-  window.addEventListener('kg-network-back', () => {
-    data.fetchState()
-    offline.flush()
-  })
-  if (navigator.onLine) offline.flush()
+  data.fetchState()
+  offline.ensurePermit().then(() => offline.flush())
+})
+// 会话失效（401）→ 回登录页
+window.addEventListener('kg-unauthorized', () => {
+  auth.session = null
+  localStorage.removeItem('kg_auth')
+  window.location.href = '/login'
 })
 </script>
 

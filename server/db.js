@@ -270,6 +270,34 @@ CREATE TABLE IF NOT EXISTS sync_meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+
+-- 登录会话（演示用 Bearer token，服务端签发与校验，不信任客户端角色）
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 接送放行一次性核验令牌：verify 成功后签发，checkout 成功后销毁
+CREATE TABLE IF NOT EXISTS pickup_verifications (
+  token TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  person_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  used INTEGER DEFAULT 0,
+  created_via TEXT DEFAULT 'online',  -- online | offline
+  created_by TEXT,
+  created_at TEXT NOT NULL
+);
+
+-- 门卫离线许可：联网时按门卫会话当日签发（批量有效），断网期间的本机放行据此在补传时鉴权
+CREATE TABLE IF NOT EXISTS gate_offline_permits (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  user_name TEXT,
+  date TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 `)
 
 export function nowStr() {
