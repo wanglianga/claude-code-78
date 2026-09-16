@@ -492,52 +492,144 @@ app.post('/api/fever-isolations', requireRole('health'), wrap((req, res) => {
 }))
 
 // 保健老师生成"带回就医建议"并通知家长
+// 处置时间线不可倒退：开始 → 通知 → 建议 → 解除。
+// - 进行中记录：按实际时刻登记/补录，缺省=当前时刻，生成预警与家长沟通，状态推进为 advised。
+// - 已解除记录：仅允许"历史补录"——建议/通知时刻必须严格早于原解除时刻且满足 开始→通知→建议，
+//   补录后保持 status='released' 与原解除时间；只按历史时刻补写一条家长沟通入档，不产生任何新预警。
+// - 通知/建议晚于（或等于）解除时刻一律 4xx，且在任何写入之前拦截：状态、解除时间、沟通、预警、消毒均不变。
 app.post('/api/fever-isolations/:id/advice', requireRole('health'), wrap((req, res) => {
   const fi = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.params.id)
   if (!fi) throw new GateError(404, '隔离记录不存在')
-  if (!req.body.advice) throw new GateError(400, '请填写就医建议')
+
+  const b = req.body || {}
+  const hasAdvice = !!(b.advice && String(b.advice).trim())
+  const hasNotifyInput = b.parentNotifiedAt != null && String(b.parentNotifiedAt) !== ''
+  if (!hasAdvice && !hasNotifyInput) throw new GateError(400, '请填写就医建议或家长通知时间')
 
   const { date: todayDate, stamp: nowS } = nowStamp()
+  const releasedRecord = fi.status === 'released' || !!fi.released
   const startStamp = `${fi.date} ${fi.start_time}`
-  // 建议时刻：允许补录，缺省=当前；不能早于隔离开始、不能晚于当前
-  let adviceStamp = normalizeStamp(req.body.adviceAt, todayDate) || nowS
-  if (adviceStamp.slice(0, 10) !== fi.date) throw new GateError(400, '就医建议时间必须为隔离当日')
-  if (adviceStamp > nowS) throw new GateError(400, '就医建议时间不能晚于当前时刻')
-  if (adviceStamp < startStamp) {
-    throw new GateError(400, `就医建议 ${adviceStamp.slice(11)} 早于隔离开始 ${fi.start_time}，时间线倒置`)
+  const releaseStamp = releasedRecord && fi.released_at ? `${fi.date} ${fi.released_at}` : null
+  if (releasedRecord && !releaseStamp) {
+    throw new GateError(409, '该隔离状态为已解除但缺少解除时间，无法补录，请核对档案')
   }
-  // 家长通知时刻：有记录则必须不早于开始、不晚于建议；未记录则视为在建议同时完成通知
+
+  // 建议时刻：仅在提交建议内容时参与校验/落库（支持只补通知）；缺省=当前，必须当日、不晚于当前、不早于开始
+  let adviceStamp = null
+  if (hasAdvice) {
+    adviceStamp = normalizeStamp(b.adviceAt, todayDate) || nowS
+    if (adviceStamp.slice(0, 10) !== fi.date) throw new GateError(400, '就医建议时间必须为隔离当日')
+    if (adviceStamp > nowS) throw new GateError(400, '就医建议时间不能晚于当前时刻')
+    if (adviceStamp < startStamp) {
+      throw new GateError(400, `就医建议 ${adviceStamp.slice(11)} 早于隔离开始 ${fi.start_time}，时间线倒置`)
+    }
+  }
+
+  // 家长通知时刻：显式传入以传入为准；否则沿用既有通知；进行中记录登记建议时仍缺通知则视为建议同时通知
   let notifyStamp = fi.parent_notified_at ? `${fi.date} ${fi.parent_notified_at}` : null
-  if (req.body.parentNotifiedAt) {
-    notifyStamp = normalizeStamp(req.body.parentNotifiedAt, todayDate)
+  let notifyProvided = false
+  if (hasNotifyInput) {
+    notifyProvided = true
+    notifyStamp = normalizeStamp(b.parentNotifiedAt, todayDate)
     if (!notifyStamp) throw new GateError(400, '家长通知时间格式不正确')
-    if (notifyStamp < startStamp) throw new GateError(400, `家长通知 ${notifyStamp.slice(11)} 早于隔离开始 ${fi.start_time}`)
-    if (notifyStamp > adviceStamp) throw new GateError(400, '家长通知时间不能晚于就医建议时间')
-  } else if (!notifyStamp) {
+    if (notifyStamp.slice(0, 10) !== fi.date) throw new GateError(400, '家长通知时间必须为隔离当日')
+    if (notifyStamp > nowS) throw new GateError(400, '家长通知时间不能晚于当前时刻')
+  } else if (!notifyStamp && hasAdvice && !releasedRecord) {
     notifyStamp = adviceStamp
   }
 
+  // 不可倒退顺序：开始 → 通知 → 建议（仅校验本次补录后实际存在的时刻）
+  if (notifyStamp && notifyStamp < startStamp) {
+    throw new GateError(400, `家长通知 ${notifyStamp.slice(11)} 早于隔离开始 ${fi.start_time}，时间线倒置`)
+  }
+  if (notifyStamp && adviceStamp && notifyStamp > adviceStamp) {
+    throw new GateError(400, `家长通知 ${notifyStamp.slice(11)} 晚于就医建议 ${adviceStamp.slice(11)}，时间线倒置`)
+  }
+  // 已有的另一侧历史事实同样约束本次补录：补通知不得晚于既有建议，补建议不得早于既有通知
+  if (hasNotifyInput && fi.advice_at && notifyStamp > `${fi.date} ${fi.advice_at}`) {
+    throw new GateError(400, `家长通知 ${notifyStamp.slice(11)} 晚于已留痕的就医建议 ${fi.advice_at}，时间线倒置`)
+  }
+  if (hasAdvice && fi.parent_notified_at && !notifyProvided && `${fi.date} ${fi.parent_notified_at}` > adviceStamp) {
+    throw new GateError(400, `就医建议 ${adviceStamp.slice(11)} 早于已留痕的家长通知 ${fi.parent_notified_at}，时间线倒置`)
+  }
+
+  // 已解除记录：只能补录解除之前的历史信息；以下门禁全部在写库之前判定，失败即 4xx 无任何副作用
+  if (releasedRecord) {
+    if (adviceStamp && adviceStamp >= releaseStamp) {
+      throw new GateError(400, `就医建议 ${adviceStamp.slice(11)} 不早于解除时间 ${fi.released_at}，已解除记录仅允许补录解除之前的历史信息，隔离状态与解除时间不变`)
+    }
+    if (notifyProvided && notifyStamp >= releaseStamp) {
+      throw new GateError(400, `家长通知 ${notifyStamp.slice(11)} 不早于解除时间 ${fi.released_at}，已解除记录仅允许补录解除之前的历史信息，隔离状态与解除时间不变`)
+    }
+
+    // 历史补录落库：只写本次提交的字段，绝不触碰 released / released_at / status，不产生任何新预警
+    db.prepare(`UPDATE fever_isolations SET
+      medical_advice=CASE WHEN ?=1 THEN ? ELSE medical_advice END,
+      advice_at=CASE WHEN ?=1 THEN ? ELSE advice_at END,
+      advice_by=CASE WHEN ?=1 THEN ? ELSE advice_by END,
+      parent_notified_at=CASE WHEN ?=1 THEN ? ELSE parent_notified_at END
+      WHERE id=?`)
+      .run(hasAdvice ? 1 : 0, String(b.advice || '').trim(),
+        adviceStamp ? 1 : 0, adviceStamp ? adviceStamp.slice(11) : null,
+        hasAdvice ? 1 : 0, req.user.name,
+        notifyProvided ? 1 : 0, notifyStamp ? notifyStamp.slice(11) : null,
+        fi.id)
+    const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', fi.child_id)
+    // 仅为原先遗漏（字段为空）的事件按发生时刻补写家长沟通；重复提交已有事件不重复入档
+    if (hasAdvice && !fi.advice_at) {
+      const happenedAt = `${adviceStamp.slice(0, 10)}T${adviceStamp.slice(11)}:00+08:00`
+      db.prepare(`INSERT INTO communications (id,child_id,class_id,channel,from_user,from_name,to_role,content,acked,created_at)
+        VALUES (?,?,?, 'app', ?, ?, 'parent', ?, 0, ?)`)
+        .run(uid('cm'), fi.child_id, child?.classId, req.user.name, req.user.name,
+          `【发热隔离就医建议·历史补录】${String(b.advice).trim()}（${req.user.name} ${adviceStamp.slice(11)}）`, happenedAt)
+    }
+    if (notifyProvided && !fi.parent_notified_at) {
+      const happenedAt = `${notifyStamp.slice(0, 10)}T${notifyStamp.slice(11)}:00+08:00`
+      db.prepare(`INSERT INTO communications (id,child_id,class_id,channel,from_user,from_name,to_role,content,acked,created_at)
+        VALUES (?,?,?, 'app', ?, ?, 'parent', ?, 0, ?)`)
+        .run(uid('cm'), fi.child_id, child?.classId, req.user.name, req.user.name,
+          `【发热隔离家长通知·历史补录】${req.user.name} 已于 ${notifyStamp.slice(11)} 告知家长幼儿发热隔离与就医安排`, happenedAt)
+    }
+    broadcast('isolation')
+    return res.json({
+      ok: true, historical: true, status: 'released', releasedAt: fi.released_at,
+      adviceAt: adviceStamp ? adviceStamp.slice(11) : fi.advice_at,
+      parentNotifiedAt: notifyProvided ? notifyStamp.slice(11) : fi.parent_notified_at
+    })
+  }
+
+  // 进行中记录：正常登记建议（必须含建议内容），状态推进 advised，并发布预警
+  if (!hasAdvice) {
+    // 进行中记录仅补通知时刻（尚无建议）：更新通知时间但不推进状态、不发预警
+    if (hasNotifyInput) {
+      db.prepare('UPDATE fever_isolations SET parent_notified_at=? WHERE id=?')
+        .run(notifyStamp.slice(11), fi.id)
+      broadcast('isolation')
+      return res.json({ ok: true, parentNotifiedAt: notifyStamp.slice(11) })
+    }
+    throw new GateError(400, '请填写就医建议')
+  }
   db.prepare(`UPDATE fever_isolations SET medical_advice=?, advice_at=?, advice_by=?,
     parent_notified_at=?, status='advised' WHERE id=?`)
-    .run(req.body.advice, adviceStamp.slice(11), req.user.name, notifyStamp.slice(11), fi.id)
+    .run(String(b.advice).trim(), adviceStamp.slice(11), req.user.name, notifyStamp.slice(11), fi.id)
   const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', fi.child_id)
   pushAlert({
     type: 'fever', childId: fi.child_id, classId: child?.classId, severity: 'critical',
     forRoles: 'health,teacher,principal,parent',
     title: `带回就医建议：${child?.name}（${adviceStamp.slice(11)}）`,
-    message: req.body.advice
+    message: String(b.advice).trim()
   })
-  // 沟通记录按事件发生时刻入档（补录时 created_at 与通知/建议时刻一致）
+  // 沟通记录按事件发生时刻入档（补录时 created_at 与建议时刻一致）
   const happenedAt = `${adviceStamp.slice(0, 10)}T${adviceStamp.slice(11)}:00+08:00`
   db.prepare(`INSERT INTO communications (id,child_id,class_id,channel,from_user,from_name,to_role,content,acked,created_at)
     VALUES (?,?,?, 'app', ?, ?, 'parent', ?, 0, ?)`)
     .run(uid('cm'), fi.child_id, child?.classId, req.user.name, req.user.name,
-      `【发热隔离就医建议】${req.body.advice}（${req.user.name} ${adviceStamp.slice(11)}）`, happenedAt)
+      `【发热隔离就医建议】${String(b.advice).trim()}（${req.user.name} ${adviceStamp.slice(11)}）`, happenedAt)
   broadcast('isolation')
   res.json({ ok: true, adviceAt: adviceStamp.slice(11), parentNotifiedAt: notifyStamp.slice(11) })
 }))
 
-// 解除隔离（不得早于就医建议/通知；允许补录历史解除时刻）
+// 解除隔离（时间线不可倒退：不得早于通知/建议；允许补录历史解除时刻）
 app.post('/api/fever-isolations/:id/release', requireRole('health'), wrap((req, res) => {
   const fi = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.params.id)
   if (!fi) throw new GateError(404, '隔离记录不存在')
@@ -547,6 +639,9 @@ app.post('/api/fever-isolations/:id/release', requireRole('health'), wrap((req, 
   let releaseStamp = normalizeStamp(req.body.releasedAt, fi.date) || nowS
   if (releaseStamp > nowS) throw new GateError(400, '解除时间不能晚于当前时刻')
   if (releaseStamp < startStamp) throw new GateError(400, '解除时间不能早于隔离开始')
+  if (fi.parent_notified_at && releaseStamp < `${fi.date} ${fi.parent_notified_at}`) {
+    throw new GateError(400, '解除时间不能早于家长通知时间')
+  }
   if (fi.advice_at && releaseStamp < `${fi.date} ${fi.advice_at}`) {
     throw new GateError(400, '解除时间不能早于就医建议时间')
   }

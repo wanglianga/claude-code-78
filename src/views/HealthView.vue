@@ -83,6 +83,7 @@
           <div class="row" style="gap:6px">
             <button v-if="fi.status !== 'released'" class="btn btn-sm btn-primary" @click="openAdvice(fi)">带回就医建议</button>
             <button v-if="fi.status !== 'released'" class="btn btn-sm" @click="release(fi)">解除隔离</button>
+            <button v-else class="btn btn-sm" @click="openAdvice(fi)">补录通知/建议</button>
           </div>
         </div>
         <dl class="kv" style="margin-top:6px">
@@ -156,20 +157,34 @@
       </div>
     </div>
 
-    <!-- 就医建议弹窗 -->
+    <!-- 就医建议弹窗（进行中=登记建议；已解除=仅可补录解除之前遗漏的通知/建议，状态保持已解除） -->
     <div v-if="adviceTarget" class="modal-mask" @click.self="adviceTarget = null">
       <div class="modal">
         <h3>带回就医建议 · {{ childName(adviceTarget.childId) }}</h3>
-        <p class="small muted">将通过家长端推送并写入当日档案；建议明确就诊科室、返园条件。补录历史时不得早于隔离开始（{{ adviceTarget.startTime }}）。</p>
-        <label class="field"><span>建议内容</span><textarea v-model="adviceText" rows="4"
-          placeholder="如：立即带回就医，行退热及呼吸道检查，退热满48小时、凭医疗机构返园证明复园" /></label>
+        <p v-if="adviceReleased" class="hint">
+          该记录已于 {{ adviceTarget.releasedAt }} 解除。仅可补录<b>早于 {{ adviceTarget.releasedAt }}</b>
+          且符合 开始（{{ adviceTarget.startTime }}）→ 通知 → 建议 顺序的历史信息；补录后仍为「已解除」，
+          不会新增家长预警或改变消毒关联。
+        </p>
+        <p v-else class="small muted">将通过家长端推送并写入当日档案；建议明确就诊科室、返园条件。补录历史时不得早于隔离开始（{{ adviceTarget.startTime }}）。</p>
+        <label class="field">
+          <span>建议内容{{ adviceReleased ? '（仅补建议时填写，只补通知可留空）' : '' }}</span>
+          <textarea v-model="adviceText" rows="4"
+            placeholder="如：立即带回就医，行退热及呼吸道检查，退热满48小时、凭医疗机构返园证明复园" />
+        </label>
         <div class="row">
-          <label class="field grow"><span>家长通知时间</span><input v-model="adviceNotifyAt" type="time" :max="nowHHMM" /></label>
-          <label class="field grow"><span>建议发生时间</span><input v-model="adviceAt" type="time" :max="nowHHMM" /></label>
+          <label class="field grow">
+            <span>家长通知时间{{ adviceTarget.parentNotifiedAt ? `（已留痕 ${adviceTarget.parentNotifiedAt}）` : '' }}</span>
+            <input v-model="adviceNotifyAt" type="time" :max="adviceReleased ? adviceTarget.releasedAt! : nowHHMM" />
+          </label>
+          <label class="field grow">
+            <span>建议发生时间{{ adviceReleased ? `（须早于解除 ${adviceTarget.releasedAt}）` : '' }}</span>
+            <input v-model="adviceAt" type="time" :max="adviceReleased ? adviceTarget.releasedAt! : nowHHMM" />
+          </label>
         </div>
         <div class="spread">
           <button class="btn" @click="adviceTarget = null">取消</button>
-          <button class="btn btn-primary" @click="saveAdvice">生成建议并通知家长</button>
+          <button class="btn btn-primary" @click="saveAdvice">{{ adviceReleased ? '保存历史补录（保持已解除）' : '生成建议并通知家长' }}</button>
         </div>
       </div>
     </div>
@@ -385,25 +400,63 @@ const adviceTarget = ref<FeverIsolation | null>(null)
 const adviceText = ref('')
 const adviceNotifyAt = ref(hhmmNow())
 const adviceAt = ref(hhmmNow())
+// 已解除记录的历史补录：只允许早于解除时刻、符合 开始→通知→建议 的信息，状态始终保持 released
+const adviceReleased = computed(() => adviceTarget.value?.status === 'released')
 function openAdvice(fi: FeverIsolation) {
   adviceTarget.value = fi
-  adviceText.value = fi.medicalAdvice || '建议立即带回就医，行退热及相关检查，退热满48小时、凭医疗机构返园证明复园。'
-  adviceNotifyAt.value = fi.parentNotifiedAt || hhmmNow()
-  adviceAt.value = hhmmNow()
+  const released = fi.status === 'released'
+  adviceText.value = released ? '' : (fi.medicalAdvice || '建议立即带回就医，行退热及相关检查，退热满48小时、凭医疗机构返园证明复园。')
+  // 已解除记录缺省留空，由保健老师按实际历史时刻填写（禁止默认当前时刻）
+  adviceNotifyAt.value = fi.parentNotifiedAt || (released ? '' : hhmmNow())
+  adviceAt.value = released ? (fi.adviceAt || '') : hhmmNow()
 }
 async function saveAdvice() {
-  if (!adviceTarget.value) return
-  if (adviceAt.value < adviceTarget.value.startTime) { ui.show('建议时间不能早于隔离开始', 'err'); return }
-  if (adviceNotifyAt.value > adviceAt.value) { ui.show('家长通知不能晚于建议时间', 'err'); return }
-  await api.isolationAdvice(adviceTarget.value.id, {
-    advice: adviceText.value, adviceAt: adviceAt.value, parentNotifiedAt: adviceNotifyAt.value
-  })
-  ui.show('就医建议已推送家长端并入档')
-  adviceTarget.value = null
+  const fi = adviceTarget.value
+  if (!fi) return
+  const released = fi.status === 'released'
+  const withAdvice = !!adviceText.value.trim()
+  const withNotify = !!adviceNotifyAt.value
+  if (!withAdvice && !withNotify) { ui.show('请填写就医建议或家长通知时间', 'err'); return }
+  if (withAdvice && adviceAt.value < fi.startTime) { ui.show('建议时间不能早于隔离开始', 'err'); return }
+  if (withNotify && adviceNotifyAt.value < fi.startTime) { ui.show('家长通知时间不能早于隔离开始', 'err'); return }
+  if (withAdvice && withNotify && adviceNotifyAt.value > adviceAt.value) {
+    ui.show('家长通知不能晚于建议时间', 'err'); return
+  }
+  if (!withAdvice && withNotify && fi.adviceAt && adviceNotifyAt.value > fi.adviceAt) {
+    ui.show('家长通知不能晚于已留痕的建议时间', 'err'); return
+  }
+  if (withAdvice && !withNotify && fi.parentNotifiedAt && fi.parentNotifiedAt > adviceAt.value) {
+    ui.show('建议时间不能早于已留痕的家长通知时间', 'err'); return
+  }
+  if (released) {
+    if (withAdvice && !adviceAt.value) { ui.show('补录建议需填写建议发生时间', 'err'); return }
+    if (withAdvice && adviceAt.value >= fi.releasedAt!) {
+      ui.show(`建议时间必须早于解除时间 ${fi.releasedAt}，晚于解除的补录会被拒绝`, 'err'); return
+    }
+    if (withNotify && adviceNotifyAt.value >= fi.releasedAt!) {
+      ui.show(`家长通知必须早于解除时间 ${fi.releasedAt}，晚于解除的补录会被拒绝`, 'err'); return
+    }
+  }
+  if (!released && !withAdvice) { ui.show('请填写就医建议', 'err'); return }
+  try {
+    await api.isolationAdvice(fi.id, {
+      advice: withAdvice ? adviceText.value.trim() : undefined,
+      adviceAt: withAdvice ? adviceAt.value : undefined,
+      parentNotifiedAt: withNotify ? adviceNotifyAt.value : undefined
+    })
+    ui.show(released ? '历史补录已入档，记录保持「已解除」' : '就医建议已推送家长端并入档')
+    adviceTarget.value = null
+    await data.fetchState()
+  } catch (e: any) {
+    ui.show(e.message, 'err')
+  }
 }
 async function release(fi: FeverIsolation) {
-  await api.isolationRelease(fi.id, { releasedAt: hhmmNow() })
-  ui.show('隔离已解除')
+  try {
+    await api.isolationRelease(fi.id, { releasedAt: hhmmNow() })
+    ui.show('隔离已解除')
+    await data.fetchState()
+  } catch (e: any) { ui.show(e.message, 'err') }
 }
 
 const spForm = reactive({ classId: '', scope: '', dueTime: '17:00' })

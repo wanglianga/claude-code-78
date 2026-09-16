@@ -34,7 +34,7 @@
 
       <!-- 发热隔离与就医建议 -->
       <div v-if="isolation(c.id)" class="sub iso-box">
-        <h4>🏥 园内发热隔离{{ isolation(c.id)!.status === 'released' ? '（已解除）' : '' }}</h4>
+        <h4>🏥 园内发热隔离{{ isolation(c.id)!.status === 'released' ? `（已解除 ${isolation(c.id)!.releasedAt || ''}）` : '' }}</h4>
         <div class="iso-line">
           <span class="badge badge-red">{{ isolation(c.id)!.temperature }}℃</span>
           <span v-for="s in isolation(c.id)!.symptoms" :key="s" class="badge badge-amber">{{ s }}</span>
