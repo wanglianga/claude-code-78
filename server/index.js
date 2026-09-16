@@ -502,9 +502,35 @@ app.post('/api/classmate-observations', requireRole('teacher', 'health'), wrap((
   const items = Array.isArray(req.body.items) ? req.body.items : []
   const iso = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.body.isolationId)
   if (!iso) throw new GateError(404, '隔离记录不存在')
-  if (req.user.role === 'teacher' && childClass(iso.child_id) !== req.user.classId) {
+  // 以隔离幼儿所在班级为唯一合法范围（发热班级）
+  const classId = childClass(iso.child_id)
+  if (!classId) throw new GateError(400, '隔离幼儿缺少班级信息，无法登记同班观察')
+  if (req.user.role === 'teacher' && classId !== req.user.classId) {
     throw new GateError(403, '只能观察本班幼儿')
   }
+
+  // ① 整批预校验（只读，发生在任何写入之前）：只接受该隔离班级的在园儿童，
+  //    跨班 / 非本班 / 不存在 / 被隔离者本人 / 同批重复 → 整批 4xx，
+  //    已有观察、异常计数、预警、次日提醒、消毒安排、班级档案均不变。
+  if (!items.length) throw new GateError(400, '观察名单为空')
+  const seen = new Set()
+  for (const r of items) {
+    if (!r || !r.childId) throw new GateError(400, '观察条目缺少幼儿标识，整批未写入')
+    if (seen.has(r.childId)) throw new GateError(400, `名单中幼儿重复（${r.childId}），整批未写入`)
+    seen.add(r.childId)
+    if (r.childId === iso.child_id) {
+      throw new GateError(400, '被隔离幼儿本人不属于同班观察对象，整批未写入')
+    }
+    const child = db.prepare('SELECT class_id FROM children WHERE id=?').get(r.childId)
+    if (!child) throw new GateError(404, `幼儿不存在（${r.childId}），整批未写入`)
+    if (child.class_id !== classId) {
+      throw new GateError(403, `幼儿不属于发热班级：仅接受本班（${classId}）在园儿童，整批未写入`)
+    }
+    if (r.temperature !== undefined && r.temperature !== null && r.temperature !== '' && Number.isNaN(Number(r.temperature))) {
+      throw new GateError(400, '体温格式不正确，整批未写入')
+    }
+  }
+
   let abnormalCount = 0
   const ins = db.prepare(`INSERT INTO classmate_observations
     (id,isolation_id,class_id,child_id,date,cough,absent,parent_feedback,temperature,abnormal,by_user,created_at)
@@ -512,12 +538,13 @@ app.post('/api/classmate-observations', requireRole('teacher', 'health'), wrap((
     ON CONFLICT(isolation_id,child_id) DO UPDATE SET
       cough=excluded.cough, absent=excluded.absent, parent_feedback=excluded.parent_feedback,
       temperature=excluded.temperature, abnormal=excluded.abnormal, by_user=excluded.by_user`)
+  // ② 全部条目通过门禁后才事务落库
   const tx = db.transaction((rows) => {
     for (const r of rows) {
       const temp = r.temperature ? Number(r.temperature) : null
       const abnormal = r.cough || r.absent || (temp && temp >= 37.3) ? 1 : 0
       if (abnormal) abnormalCount++
-      ins.run(uid('co'), iso.id, iso.class_id ? iso.class_id : childClass(iso.child_id), r.childId,
+      ins.run(uid('co'), iso.id, classId, r.childId,
         today(), r.cough ? 1 : 0, r.absent ? 1 : 0, r.parentFeedback || '', temp,
         abnormal, req.user.name, nowStr())
     }
@@ -526,7 +553,7 @@ app.post('/api/classmate-observations', requireRole('teacher', 'health'), wrap((
   const child = one('SELECT name FROM children WHERE id=?', iso.child_id)
   if (abnormalCount) {
     pushAlert({
-      type: 'fever', childId: iso.child_id, classId: iso.class_id, severity: 'critical',
+      type: 'fever', childId: iso.child_id, classId, severity: 'critical',
       forRoles: 'health,teacher,principal',
       title: `同班观察发现 ${abnormalCount} 名异常儿童：${child?.name} 发热关联`,
       message: '已纳入次日晨检重点名单，并建议加强班级消毒'
