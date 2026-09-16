@@ -437,6 +437,31 @@ app.post('/api/fever-isolations', requireRole('health'), wrap((req, res) => {
   if (!child) throw new GateError(404, '幼儿不存在')
   if (!(Number(b.temperature) >= 37.3)) throw new GateError(400, '隔离登记体温需 ≥37.3℃')
   if (!b.isolationRoom) throw new GateError(400, '请填写隔离室')
+
+  // —— 园区时间线校验（所有时刻按 Asia/Shanghai）——
+  const { date: todayDate, stamp: nowS } = nowStamp()
+  // 支持补录：HH:MM 或 'YYYY-MM-DD HH:MM'；缺省=当前时刻
+  let startStamp = normalizeStamp(b.startTime, todayDate) || nowS
+  if (startStamp.length === 16 && !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(startStamp)) {
+    throw new GateError(400, '隔离开始时间格式不正确')
+  }
+  if (startStamp.slice(0, 10) !== todayDate) {
+    throw new GateError(400, '隔离开始时间必须为当日时刻')
+  }
+  // 不得把未来时刻登记为“已发生隔离”
+  if (startStamp > nowS) {
+    throw new GateError(400, `隔离开始时间 ${startStamp.slice(11)} 晚于当前时刻 ${nowS.slice(11)}，不能登记为已发生的隔离`)
+  }
+  let notifyStamp = null
+  if (b.parentNotifiedAt) {
+    notifyStamp = normalizeStamp(b.parentNotifiedAt, todayDate)
+    if (!notifyStamp) throw new GateError(400, '家长通知时间格式不正确')
+    if (notifyStamp > nowS) throw new GateError(400, '家长通知时间不能晚于当前时刻')
+    if (notifyStamp < startStamp) {
+      throw new GateError(400, `家长通知时间 ${notifyStamp.slice(11)} 早于隔离开始 ${startStamp.slice(11)}，时间线倒置`)
+    }
+  }
+
   // 同班未解除的活动隔离不重复建档
   const exist = one(`SELECT id FROM fever_isolations WHERE child_id=? AND date=? AND status!='released'`, b.childId, today())
   if (exist) throw new GateError(409, '该幼儿今日已有进行中的隔离记录')
@@ -447,14 +472,14 @@ app.post('/api/fever-isolations', requireRole('health'), wrap((req, res) => {
     (id,child_id,date,temperature,symptoms,isolation_room,start_time,parent_notified_at,class_contact,status,by_user,created_at)
     VALUES (?,?,?,?,?,?,?,?,?, 'isolating', ?, ?)`)
     .run(id, b.childId, today(), Number(b.temperature), symptoms, b.isolationRoom,
-      b.startTime || nowHHMM(), b.parentNotifiedAt || null, b.classContact || '',
+      startStamp.slice(11), notifyStamp ? notifyStamp.slice(11) : null, b.classContact || '',
       req.user.name, nowStr())
   const childInfo = toCamel(child)
   pushAlert({
     type: 'fever', childId: b.childId, classId: child.class_id, severity: 'critical',
     forRoles: 'health,teacher,principal,parent',
     title: `午后发热隔离：${child.name} ${b.temperature}℃`,
-    message: `已入${b.isolationRoom}，请班主任立即追踪同班儿童咳嗽/缺勤/家长反馈，保育员准备班级消毒`
+    message: `${startStamp.slice(11)} 已入${b.isolationRoom}${notifyStamp ? `，${notifyStamp.slice(11)} 已通知家长` : ''}，请班主任立即追踪同班儿童咳嗽/缺勤/家长反馈，保育员准备班级消毒`
   })
   pushAlert({
     type: 'fever', childId: b.childId, classId: child.class_id, severity: 'warn',
@@ -471,30 +496,64 @@ app.post('/api/fever-isolations/:id/advice', requireRole('health'), wrap((req, r
   const fi = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.params.id)
   if (!fi) throw new GateError(404, '隔离记录不存在')
   if (!req.body.advice) throw new GateError(400, '请填写就医建议')
+
+  const { date: todayDate, stamp: nowS } = nowStamp()
+  const startStamp = `${fi.date} ${fi.start_time}`
+  // 建议时刻：允许补录，缺省=当前；不能早于隔离开始、不能晚于当前
+  let adviceStamp = normalizeStamp(req.body.adviceAt, todayDate) || nowS
+  if (adviceStamp.slice(0, 10) !== fi.date) throw new GateError(400, '就医建议时间必须为隔离当日')
+  if (adviceStamp > nowS) throw new GateError(400, '就医建议时间不能晚于当前时刻')
+  if (adviceStamp < startStamp) {
+    throw new GateError(400, `就医建议 ${adviceStamp.slice(11)} 早于隔离开始 ${fi.start_time}，时间线倒置`)
+  }
+  // 家长通知时刻：有记录则必须不早于开始、不晚于建议；未记录则视为在建议同时完成通知
+  let notifyStamp = fi.parent_notified_at ? `${fi.date} ${fi.parent_notified_at}` : null
+  if (req.body.parentNotifiedAt) {
+    notifyStamp = normalizeStamp(req.body.parentNotifiedAt, todayDate)
+    if (!notifyStamp) throw new GateError(400, '家长通知时间格式不正确')
+    if (notifyStamp < startStamp) throw new GateError(400, `家长通知 ${notifyStamp.slice(11)} 早于隔离开始 ${fi.start_time}`)
+    if (notifyStamp > adviceStamp) throw new GateError(400, '家长通知时间不能晚于就医建议时间')
+  } else if (!notifyStamp) {
+    notifyStamp = adviceStamp
+  }
+
   db.prepare(`UPDATE fever_isolations SET medical_advice=?, advice_at=?, advice_by=?,
-    parent_notified_at=COALESCE(parent_notified_at,?), status='advised' WHERE id=?`)
-    .run(req.body.advice, nowHHMM(), req.user.name, req.body.parentNotifiedAt || nowHHMM(), fi.id)
+    parent_notified_at=?, status='advised' WHERE id=?`)
+    .run(req.body.advice, adviceStamp.slice(11), req.user.name, notifyStamp.slice(11), fi.id)
   const child = one('SELECT name, class_id AS classId FROM children WHERE id=?', fi.child_id)
   pushAlert({
     type: 'fever', childId: fi.child_id, classId: child?.classId, severity: 'critical',
     forRoles: 'health,teacher,principal,parent',
-    title: `带回就医建议：${child?.name}`,
+    title: `带回就医建议：${child?.name}（${adviceStamp.slice(11)}）`,
     message: req.body.advice
   })
+  // 沟通记录按事件发生时刻入档（补录时 created_at 与通知/建议时刻一致）
+  const happenedAt = `${adviceStamp.slice(0, 10)}T${adviceStamp.slice(11)}:00+08:00`
   db.prepare(`INSERT INTO communications (id,child_id,class_id,channel,from_user,from_name,to_role,content,acked,created_at)
     VALUES (?,?,?, 'app', ?, ?, 'parent', ?, 0, ?)`)
     .run(uid('cm'), fi.child_id, child?.classId, req.user.name, req.user.name,
-      `【发热隔离就医建议】${req.body.advice}（${req.user.name} ${nowHHMM()}）`, nowStr())
+      `【发热隔离就医建议】${req.body.advice}（${req.user.name} ${adviceStamp.slice(11)}）`, happenedAt)
   broadcast('isolation')
-  res.json({ ok: true })
+  res.json({ ok: true, adviceAt: adviceStamp.slice(11), parentNotifiedAt: notifyStamp.slice(11) })
 }))
 
-// 解除隔离
+// 解除隔离（不得早于就医建议/通知；允许补录历史解除时刻）
 app.post('/api/fever-isolations/:id/release', requireRole('health'), wrap((req, res) => {
+  const fi = db.prepare('SELECT * FROM fever_isolations WHERE id=?').get(req.params.id)
+  if (!fi) throw new GateError(404, '隔离记录不存在')
+  if (fi.released) throw new GateError(409, '该隔离已解除，不能重复操作')
+  const { stamp: nowS } = nowStamp()
+  const startStamp = `${fi.date} ${fi.start_time}`
+  let releaseStamp = normalizeStamp(req.body.releasedAt, fi.date) || nowS
+  if (releaseStamp > nowS) throw new GateError(400, '解除时间不能晚于当前时刻')
+  if (releaseStamp < startStamp) throw new GateError(400, '解除时间不能早于隔离开始')
+  if (fi.advice_at && releaseStamp < `${fi.date} ${fi.advice_at}`) {
+    throw new GateError(400, '解除时间不能早于就医建议时间')
+  }
   db.prepare(`UPDATE fever_isolations SET released=1, released_at=?, status='released' WHERE id=?`)
-    .run(req.body.releasedAt || nowHHMM(), req.params.id)
+    .run(releaseStamp.slice(11), req.params.id)
   broadcast('isolation')
-  res.json({ ok: true })
+  res.json({ ok: true, releasedAt: releaseStamp.slice(11) })
 }))
 
 // 同班儿童观察批量提交（班主任）：咳嗽/缺勤/家长反馈，异常者影响次日晨检
@@ -587,16 +646,28 @@ app.post('/api/sanitation-plans', requireRole('health', 'principal'), wrap((req,
 app.post('/api/sanitation-plans/:id/done', requireRole('cleaner'), wrap((req, res) => {
   const sp = db.prepare('SELECT * FROM sanitation_plans WHERE id=?').get(req.params.id)
   if (!sp) throw new GateError(404, '消毒安排不存在')
+  if (sp.status === 'done') throw new GateError(409, '该消毒安排已完成，不能重复操作')
+  const { stamp: nowS } = nowStamp()
+  let doneStamp = normalizeStamp(req.body.doneAt, sp.date) || nowS
+  if (doneStamp > nowS) throw new GateError(400, '完成时间不能晚于当前时刻')
+  // 关联发热隔离时，消毒完成不得早于隔离开始（同一园区时间线）
+  if (sp.isolation_id) {
+    const fi = db.prepare('SELECT start_time FROM fever_isolations WHERE id=?').get(sp.isolation_id)
+    if (fi && doneStamp < `${sp.date} ${fi.start_time}`) {
+      throw new GateError(400, `消毒完成 ${doneStamp.slice(11)} 早于发热隔离开始 ${fi.start_time}，时间线倒置`)
+    }
+  }
+  const doneAt = doneStamp.slice(11)
   db.prepare(`UPDATE sanitation_plans SET status='done', done_at=?, done_by=? WHERE id=?`)
-    .run(nowHHMM(), req.user.name, req.params.id)
+    .run(doneAt, req.user.name, req.params.id)
   const cls = one('SELECT name FROM classes WHERE id=?', sp.class_id)
   pushAlert({
     type: 'disease', classId: sp.class_id, severity: 'info', forRoles: 'health,teacher,principal,cleaner',
     title: `消毒完成：${cls?.name}`,
-    message: `${req.user.name} ${nowHHMM()} 完成（${sp.scope}），已进入班级记录`
+    message: `${req.user.name} ${doneAt} 完成（${sp.scope}），已进入班级记录`
   })
   broadcast('sanitation')
-  res.json({ ok: true })
+  res.json({ ok: true, doneAt })
 }))
 
 // 临时托管到其他班级
@@ -641,6 +712,16 @@ function nowStamp() {
   const hhmm = d.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit' })
   return { date, hhmm, stamp: `${date} ${hhmm}` }
 }
+
+// 归一化事件时刻输入：支持 'HH:MM'（按今日）与 'YYYY-MM-DD HH:MM'，非法返回 null
+function normalizeStamp(v, date) {
+  if (v == null || v === '') return null
+  const s = String(v).trim()
+  if (/^\d{2}:\d{2}$/.test(s)) return `${date} ${s}`
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) return s
+  return null
+}
+const HHMM_RE = /^\d{2}:\d{2}$/
 
 // 授权时间窗（常驻授权 validFrom/Until 为 NULL；临时授权按 'YYYY-MM-DD HH:MM' 窗口）
 function personValidAt(person, date, hhmm) {

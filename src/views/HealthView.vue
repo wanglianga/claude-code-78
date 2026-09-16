@@ -137,7 +137,7 @@
               <option>保健观察室</option><option>临时隔离室A</option><option>临时隔离室B</option>
             </select>
           </label>
-          <label class="field grow"><span>开始时间</span><input v-model="isoForm.startTime" type="time" /></label>
+          <label class="field grow"><span>开始时间（不得晚于当前）</span><input v-model="isoForm.startTime" type="time" :max="nowHHMM" /></label>
         </div>
         <label class="field"><span>伴随症状</span>
           <div class="chips">
@@ -145,7 +145,7 @@
               :class="{ 'on-red': isoForm.symptoms.includes(s) }" @click="toggleSymptom(s)">{{ s }}</button>
           </div>
         </label>
-        <label class="field"><span>通知家长时间</span><input v-model="isoForm.parentNotifiedAt" type="time" /></label>
+        <label class="field"><span>通知家长时间（补录不得早于开始）</span><input v-model="isoForm.parentNotifiedAt" type="time" :max="nowHHMM" /></label>
         <label class="field"><span>同班接触情况</span>
           <textarea v-model="isoForm.classContact" rows="2" placeholder="如同餐、午睡邻床、共同活动的儿童与范围" />
         </label>
@@ -160,10 +160,13 @@
     <div v-if="adviceTarget" class="modal-mask" @click.self="adviceTarget = null">
       <div class="modal">
         <h3>带回就医建议 · {{ childName(adviceTarget.childId) }}</h3>
-        <p class="small muted">将通过家长端推送并写入当日档案；建议明确就诊科室、返园条件。</p>
+        <p class="small muted">将通过家长端推送并写入当日档案；建议明确就诊科室、返园条件。补录历史时不得早于隔离开始（{{ adviceTarget.startTime }}）。</p>
         <label class="field"><span>建议内容</span><textarea v-model="adviceText" rows="4"
           placeholder="如：立即带回就医，行退热及呼吸道检查，退热满48小时、凭医疗机构返园证明复园" /></label>
-        <label class="field"><span>家长通知时间</span><input v-model="adviceNotifyAt" type="time" /></label>
+        <div class="row">
+          <label class="field grow"><span>家长通知时间</span><input v-model="adviceNotifyAt" type="time" :max="nowHHMM" /></label>
+          <label class="field grow"><span>建议发生时间</span><input v-model="adviceAt" type="time" :max="nowHHMM" /></label>
+        </div>
         <div class="spread">
           <button class="btn" @click="adviceTarget = null">取消</button>
           <button class="btn btn-primary" @click="saveAdvice">生成建议并通知家长</button>
@@ -345,6 +348,10 @@ function classmateObs(isoId: string) {
   return data.state.classmateObservations.filter(co => co.isolationId === isoId)
 }
 
+// 每分钟刷新当前时刻，供 time 输入 max 使用
+const nowHHMM = ref(hhmmNow())
+setInterval(() => { nowHHMM.value = hhmmNow() }, 30_000)
+
 const symptomOptions = ['咳嗽', '皮疹', '咽痛', '呕吐', '精神差', '腹泻']
 const isoForm = reactive({
   open: false, childId: '', temperature: 38.0, symptoms: [] as string[],
@@ -363,6 +370,10 @@ function toggleSymptom(s: string) {
 async function saveIso() {
   if (!isoForm.childId) { ui.show('请选择幼儿', 'err'); return }
   if (!(isoForm.temperature >= 37.3)) { ui.show('体温需 ≥37.3℃', 'err'); return }
+  if (isoForm.startTime > nowHHMM.value) { ui.show('开始时间不能晚于当前时刻', 'err'); return }
+  if (isoForm.parentNotifiedAt && isoForm.parentNotifiedAt < isoForm.startTime) {
+    ui.show('家长通知时间不能早于隔离开始', 'err'); return
+  }
   try {
     await api.createIsolation({ ...isoForm })
     ui.show('隔离已登记，班主任/保育员已联动')
@@ -373,15 +384,19 @@ async function saveIso() {
 const adviceTarget = ref<FeverIsolation | null>(null)
 const adviceText = ref('')
 const adviceNotifyAt = ref(hhmmNow())
+const adviceAt = ref(hhmmNow())
 function openAdvice(fi: FeverIsolation) {
   adviceTarget.value = fi
   adviceText.value = fi.medicalAdvice || '建议立即带回就医，行退热及相关检查，退热满48小时、凭医疗机构返园证明复园。'
   adviceNotifyAt.value = fi.parentNotifiedAt || hhmmNow()
+  adviceAt.value = hhmmNow()
 }
 async function saveAdvice() {
   if (!adviceTarget.value) return
+  if (adviceAt.value < adviceTarget.value.startTime) { ui.show('建议时间不能早于隔离开始', 'err'); return }
+  if (adviceNotifyAt.value > adviceAt.value) { ui.show('家长通知不能晚于建议时间', 'err'); return }
   await api.isolationAdvice(adviceTarget.value.id, {
-    advice: adviceText.value, parentNotifiedAt: adviceNotifyAt.value
+    advice: adviceText.value, adviceAt: adviceAt.value, parentNotifiedAt: adviceNotifyAt.value
   })
   ui.show('就医建议已推送家长端并入档')
   adviceTarget.value = null
